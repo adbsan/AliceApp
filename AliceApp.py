@@ -1,0 +1,600 @@
+"""
+AliceApp.py
+エントリポイント。外装モジュールと中層（heart.py）の結合を担う。
+
+実行シーケンス（設計書 §5 準拠・逆流禁止）:
+  1. Load Config      - env_binder_module で .env を読み込む
+  2. Ensure Model     - neural_loader_module でモデルをロード
+  3. Initialize Heart - AliceHeart を生成
+  4. Process Input    - prompt_shaper_module でペイロードを構築
+  5. Core Execution   - heart.execute() で推論
+  6. Handle Output    - result_log_module で永続化
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, List, Optional
+
+ROOT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(ROOT_DIR))
+
+from loguru import logger
+
+# ============================================================
+# ログ設定（起動最初期）
+# ============================================================
+LOG_DIR = ROOT_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+logger.remove()
+logger.add(
+    sys.stderr, level="INFO", colorize=True,
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | "
+           "<cyan>{name}</cyan> - <white>{message}</white>"
+)
+logger.add(
+    LOG_DIR / "alice.log", level="DEBUG",
+    rotation="10 MB", retention="30 days", encoding="utf-8"
+)
+
+# ============================================================
+# モジュールインポート
+# ============================================================
+from module import env_binder_module as env
+from module import neural_loader_module as neural
+from module import prompt_shaper_module as shaper
+from module import result_log_module as result_log
+from src.AI.heart import AliceHeart
+
+
+# ============================================================
+# AliceEngine（パイプライン制御）
+# ============================================================
+
+class AliceEngine:
+    """
+    heart.py を呼び出すパイプラインコントローラ。
+    GUI から操作されるが、推論の詳細は heart.py に完全委譲する。
+    """
+
+    def __init__(self, heart: AliceHeart) -> None:
+        self._heart = heart
+        self._history: List[shaper.Message] = []
+
+    @property
+    def history(self) -> List[shaper.Message]:
+        return list(self._history)
+
+    def send_message(
+        self,
+        user_input: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_complete: Optional[Callable[[str], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """ユーザー入力を受け取り推論パイプラインを実行する。"""
+        if not user_input.strip():
+            return
+
+        # Step 4: Process Input
+        self._history.append(shaper.new_message("user", user_input))
+        payload = shaper.build_payload(
+            user_input=user_input,
+            history=self._history[:-1],
+            max_history=50,
+            persona="",
+            temperature=0.9,
+        )
+
+        # Step 5: Core Execution
+        result = self._heart.execute(payload, on_chunk=on_chunk)
+
+        # Step 6: Handle Output
+        if result["success"]:
+            response = result["response"]
+            self._history.append(shaper.new_message("assistant", response))
+            result_log.save_history(self._history)
+            if on_complete:
+                on_complete(response)
+        else:
+            if self._history and self._history[-1].role == "user":
+                self._history.pop()
+            if on_error:
+                on_error(result["error"] or "不明なエラーが発生しました。")
+
+    def get_greeting(self) -> str:
+        """起動時の挨拶を返す（API節約のためローカル生成）。"""
+        name = env.get("ALICE_NAME")
+        msg = (
+            f"こんにちは！私は {name} です。\n"
+            "何でもお気軽に話しかけてください。お手伝いします！"
+        )
+        self._history.append(shaper.new_message("assistant", msg))
+        return msg
+
+    def clear_history(self) -> None:
+        self._history.clear()
+        result_log.clear_history()
+
+    def load_history(self) -> None:
+        raw = result_log.load_history()
+        self._history = [
+            shaper.Message.from_dict(m) for m in raw
+            if isinstance(m, dict) and "role" in m and "content" in m
+        ]
+
+
+# ============================================================
+# GitManager（外装モジュール相当）
+# ============================================================
+
+class GitManager:
+    """Git操作の外装モジュール。testbranch への commit を管理する。"""
+
+    TARGET_BRANCH = "testbranch"
+
+    def __init__(self, repo_path: str = ".") -> None:
+        self._repo_path = Path(repo_path).resolve()
+        self._repo = None
+
+        try:
+            import git
+            from git import InvalidGitRepositoryError, Repo
+            try:
+                self._repo = Repo(self._repo_path)
+                logger.info(f"Git リポジトリを検出: {self._repo_path}")
+                self._ensure_target_branch()
+            except InvalidGitRepositoryError:
+                logger.info("Git リポジトリが未初期化。新規初期化します。")
+                self._repo = Repo.init(self._repo_path)
+                self._create_initial_commit()
+        except ImportError:
+            logger.warning("GitPython が未インストールです。Git 機能は無効化されます。")
+        except Exception as e:
+            logger.error(f"Git 初期化エラー: {e}")
+            self._repo = None
+
+    @property
+    def is_available(self) -> bool:
+        return self._repo is not None
+
+    def get_status(self) -> dict:
+        if not self.is_available:
+            return {"error": "Git 利用不可"}
+        try:
+            repo = self._repo
+            branch = repo.active_branch.name
+            changed = [item.a_path for item in repo.index.diff(None)]
+            untracked = list(repo.untracked_files)
+            staged = []
+            if repo.head.is_valid():
+                try:
+                    staged = [item.a_path for item in repo.index.diff("HEAD")]
+                except Exception:
+                    pass
+            commits_ahead = 0
+            try:
+                commits_ahead = len(list(repo.iter_commits(f"origin/{branch}..{branch}")))
+            except Exception:
+                pass
+            return {
+                "branch": branch,
+                "is_target_branch": branch == self.TARGET_BRANCH,
+                "changed_files": changed,
+                "untracked_files": untracked,
+                "staged_files": staged,
+                "commits_ahead": commits_ahead,
+                "last_commit": self._get_last_commit(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def auto_commit(self, message: Optional[str] = None) -> tuple:
+        if not self.is_available:
+            return False, "Git 利用不可"
+        try:
+            self._ensure_target_branch()
+            repo = self._repo
+            source_patterns = ["*.py", "*.txt", "*.md", "*.example"]
+            staged_count = 0
+            for pattern in source_patterns:
+                for f in self._repo_path.rglob(pattern):
+                    rel = f.relative_to(self._repo_path)
+                    parts = rel.parts
+                    if any(p in ("assets", "logs", "venvAlice", "__pycache__") for p in parts):
+                        continue
+                    try:
+                        repo.index.add([str(rel)])
+                        staged_count += 1
+                    except Exception:
+                        pass
+            if staged_count == 0:
+                return False, "コミット対象のファイルがありません。"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            commit_msg = message or f"[Alice] 自動コミット - {timestamp}"
+            repo.index.commit(commit_msg)
+            logger.info(f"Git commit 完了: {commit_msg}")
+            return True, f"コミット完了: {commit_msg}"
+        except Exception as e:
+            logger.error(f"Git commit エラー: {e}")
+            return False, str(e)
+
+    def switch_branch(self, branch_name: str) -> tuple:
+        if not self.is_available:
+            return False, "Git 利用不可"
+        try:
+            repo = self._repo
+            if branch_name in repo.heads:
+                repo.heads[branch_name].checkout()
+            else:
+                repo.create_head(branch_name)
+                repo.heads[branch_name].checkout()
+            logger.info(f"ブランチ切り替え: {branch_name}")
+            return True, f"ブランチ '{branch_name}' に切り替えました。"
+        except Exception as e:
+            logger.error(f"ブランチ切り替えエラー: {e}")
+            return False, str(e)
+
+    def get_branches(self) -> list:
+        if not self.is_available:
+            return []
+        try:
+            return [h.name for h in self._repo.heads]
+        except Exception:
+            return []
+
+    def get_log(self, max_count: int = 20) -> list:
+        if not self.is_available:
+            return []
+        try:
+            commits = []
+            for commit in self._repo.iter_commits(max_count=max_count):
+                commits.append({
+                    "hash": commit.hexsha[:8],
+                    "message": commit.message.strip(),
+                    "author": str(commit.author),
+                    "date": datetime.fromtimestamp(commit.committed_date).strftime("%Y-%m-%d %H:%M"),
+                })
+            return commits
+        except Exception as e:
+            logger.error(f"Git log エラー: {e}")
+            return []
+
+    def _ensure_target_branch(self) -> None:
+        try:
+            repo = self._repo
+            if not repo.head.is_valid():
+                return
+            current = repo.active_branch.name
+            if current != self.TARGET_BRANCH:
+                if self.TARGET_BRANCH not in [h.name for h in repo.heads]:
+                    repo.create_head(self.TARGET_BRANCH)
+                repo.heads[self.TARGET_BRANCH].checkout()
+                logger.info(f"ブランチを '{self.TARGET_BRANCH}' に切り替えました。")
+        except Exception as e:
+            logger.warning(f"ブランチ切り替えをスキップ: {e}")
+
+    def _create_initial_commit(self) -> None:
+        try:
+            repo = self._repo
+            readme = self._repo_path / "README.md"
+            if readme.exists():
+                repo.index.add(["README.md"])
+            repo.index.commit("[Alice] 初期コミット")
+            repo.create_head(self.TARGET_BRANCH)
+            repo.heads[self.TARGET_BRANCH].checkout()
+            logger.info("初期コミットを作成し、testbranch に切り替えました。")
+        except Exception as e:
+            logger.error(f"初回コミット作成エラー: {e}")
+
+    def _get_last_commit(self) -> Optional[dict]:
+        try:
+            if not self._repo.head.is_valid():
+                return None
+            commit = self._repo.head.commit
+            return {
+                "hash": commit.hexsha[:8],
+                "message": commit.message.strip(),
+                "date": datetime.fromtimestamp(commit.committed_date).strftime("%Y-%m-%d %H:%M"),
+            }
+        except Exception:
+            return None
+
+
+# ============================================================
+# VoiceEngine（外装モジュール相当）
+# ============================================================
+
+class VoiceEngine:
+    """VOICEVOX を使った音声出力エンジン。"""
+
+    def __init__(self) -> None:
+        self._is_speaking = False
+        self._lock = threading.Lock()
+        self._voicevox_url = env.get("VOICEVOX_URL")
+        self._speaker_id   = int(env.get("VOICEVOX_SPEAKER_ID"))
+        self._speed        = float(env.get("VOICEVOX_SPEED"))
+        self._pitch        = float(env.get("VOICEVOX_PITCH"))
+        self._intonation   = float(env.get("VOICEVOX_INTONATION"))
+        self._volume       = float(env.get("VOICEVOX_VOLUME"))
+
+        try:
+            import requests
+            self._requests_available = True
+        except ImportError:
+            self._requests_available = False
+
+        try:
+            import pygame
+            pygame.mixer.pre_init(44100, -16, 2, 512)
+            pygame.mixer.init()
+            self._pygame_available = True
+        except ImportError:
+            self._pygame_available = False
+            logger.warning("pygame が利用できません。音声再生は無効です。")
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._is_speaking
+
+    def speak(self, text: str) -> None:
+        if not self._requests_available or not text.strip():
+            return
+        threading.Thread(target=self._speak_thread, args=(text,), daemon=True).start()
+
+    def _speak_thread(self, text: str) -> None:
+        with self._lock:
+            self._is_speaking = True
+            try:
+                wav = self._text_to_wav(text)
+                if wav:
+                    self._play_wav(wav)
+            except Exception as e:
+                logger.error(f"音声再生エラー: {e}")
+            finally:
+                self._is_speaking = False
+
+    def stop(self) -> None:
+        if self._pygame_available:
+            try:
+                import pygame
+                pygame.mixer.stop()
+            except Exception:
+                pass
+        self._is_speaking = False
+
+    def check_connection(self) -> bool:
+        try:
+            import requests
+            resp = requests.get(f"{self._voicevox_url}/version", timeout=3)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _text_to_wav(self, text: str) -> Optional[bytes]:
+        try:
+            import json
+            import requests
+            query_resp = requests.post(
+                f"{self._voicevox_url}/audio_query",
+                params={"text": text, "speaker": self._speaker_id},
+                timeout=10,
+            )
+            if query_resp.status_code != 200:
+                return None
+            query = query_resp.json()
+            query["speedScale"]      = self._speed
+            query["pitchScale"]      = self._pitch
+            query["intonationScale"] = self._intonation
+            query["volumeScale"]     = self._volume
+            synth_resp = requests.post(
+                f"{self._voicevox_url}/synthesis",
+                params={"speaker": self._speaker_id},
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(query),
+                timeout=30,
+            )
+            return synth_resp.content if synth_resp.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"WAV 生成エラー: {e}")
+            return None
+
+    def _play_wav(self, wav_data: bytes) -> None:
+        if self._pygame_available:
+            import io
+            import pygame
+            sound = pygame.mixer.Sound(io.BytesIO(wav_data))
+            sound.set_volume(self._volume)
+            channel = sound.play()
+            while channel.get_busy():
+                pygame.time.wait(50)
+        else:
+            try:
+                import os
+                import tempfile
+                import winsound
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    f.write(wav_data)
+                    tmp = f.name
+                winsound.PlaySound(tmp, winsound.SND_FILENAME)
+                os.unlink(tmp)
+            except Exception as e:
+                logger.error(f"winsound 再生エラー: {e}")
+
+
+# ============================================================
+# CharacterLoader（外装モジュール相当）
+# ============================================================
+
+class CharacterLoader:
+    """キャラクター画像ファイルを読み込む外装モジュール。"""
+
+    _POSE_MAP = {
+        "default":  "alice_default",
+        "idle":     "alice_idle",
+        "speaking": "alice_speaking",
+        "thinking": "alice_thinking",
+        "greeting": "alice_greeting",
+    }
+
+    def __init__(self) -> None:
+        self._cache = {}
+        self._images_dir = ROOT_DIR / "assets" / "images"
+        self._images_dir.mkdir(parents=True, exist_ok=True)
+        (ROOT_DIR / "assets" / "parts").mkdir(parents=True, exist_ok=True)
+
+    def initialize(self) -> None:
+        self._preload()
+
+    def get_image(self, state: str = "default"):
+        if not self._pil_available():
+            return None
+        if state in self._cache:
+            return self._cache[state]
+        fname = self._POSE_MAP.get(state, "alice_default")
+        path = self._images_dir / f"{fname}.png"
+        if path.exists():
+            try:
+                from PIL import Image
+                img = Image.open(path).convert("RGBA")
+                self._cache[state] = img
+                return img
+            except Exception as e:
+                logger.error(f"画像読み込みエラー ({fname}): {e}")
+        return None
+
+    def reload(self) -> None:
+        self._cache.clear()
+        self._preload()
+
+    def _preload(self) -> None:
+        for state in self._POSE_MAP:
+            self.get_image(state)
+
+    def _pil_available(self) -> bool:
+        try:
+            from PIL import Image
+            return True
+        except ImportError:
+            return False
+
+
+# ============================================================
+# AliceApp（起動制御・実行シーケンス）
+# ============================================================
+
+class AliceApp:
+    """
+    起動シーケンスを管理するエントリポイントクラス。
+
+    実行シーケンス (§5 準拠):
+      1. Load Config
+      2. Ensure Model
+      3. Initialize Heart
+      4-6. AliceEngine が担当（Process Input / Core Execution / Handle Output）
+    """
+
+    def __init__(self) -> None:
+        self._heart:  Optional[AliceHeart]      = None
+        self._engine: Optional[AliceEngine]     = None
+        self._voice:  Optional[VoiceEngine]     = None
+        self._git:    Optional[GitManager]      = None
+        self._loader: Optional[CharacterLoader] = None
+
+    def start(self) -> None:
+        logger.info("=" * 60)
+        logger.info("Alice AI 起動開始")
+        logger.info("=" * 60)
+
+        # Step 1: Load Config
+        self._load_config()
+
+        # Step 2: Ensure Model
+        ok, client, model_name = self._ensure_model()
+
+        # Step 3: Initialize Heart
+        if ok and client:
+            self._heart = AliceHeart(client=client, model_name=model_name)
+        else:
+            logger.warning("モデルが利用できません。チャット機能は無効化されます。")
+
+        # 外装モジュール初期化
+        self._engine = AliceEngine(self._heart) if self._heart else None
+        if self._engine:
+            self._engine.load_history()
+
+        self._voice  = self._init_voice()
+        self._git    = GitManager(repo_path=str(ROOT_DIR))
+        self._loader = CharacterLoader()
+        self._loader.initialize()
+
+        # GUI 起動
+        self._launch_gui()
+
+    def _load_config(self) -> None:
+        env_path = ROOT_DIR / ".env"
+        loaded = env.load(str(env_path))
+        if not loaded:
+            logger.warning(".env の読み込みに失敗しました。デフォルト設定で動作します。")
+
+    def _ensure_model(self) -> tuple:
+        ok, client, model_name = neural.load()
+        if not ok:
+            return False, None, ""
+        valid, msg = neural.verify_model()
+        if valid:
+            logger.info(f"モデル検証OK: {msg}")
+        else:
+            logger.warning(f"モデル検証警告: {msg}")
+        return ok, client, model_name
+
+    def _init_voice(self) -> Optional[VoiceEngine]:
+        try:
+            v = VoiceEngine()
+            logger.info("VoiceEngine 初期化完了")
+            return v
+        except Exception as e:
+            logger.error(f"VoiceEngine 初期化エラー: {e}")
+            return None
+
+    def _launch_gui(self) -> None:
+        try:
+            from gui.gui_windows import AliceMainWindow
+            window = AliceMainWindow(
+                env_binder   = env,
+                alice_engine = self._engine,
+                voice_engine = self._voice,
+                git_manager  = self._git,
+                char_loader  = self._loader,
+            )
+            logger.info("GUI 起動完了。メインループを開始します。")
+            window.run()
+        except ImportError as e:
+            logger.error(f"GUI モジュールのインポートエラー: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.exception(f"GUI 起動エラー: {e}")
+            sys.exit(1)
+
+
+# ============================================================
+# エントリポイント
+# ============================================================
+
+def main() -> None:
+    try:
+        AliceApp().start()
+    except KeyboardInterrupt:
+        logger.info("中断されました。")
+    except Exception as e:
+        logger.exception(f"致命的なエラー: {e}")
+        sys.exit(1)
+    finally:
+        logger.info("Alice AI 終了")
+
+
+if __name__ == "__main__":
+    main()
