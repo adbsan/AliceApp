@@ -562,7 +562,7 @@ class AliceApp:
 
     def _launch_gui(self) -> None:
         try:
-            from gui.gui_windows import AliceMainWindow
+            from module.window_module import AliceMainWindow
             window = AliceMainWindow(
                 env_binder   = env,
                 alice_engine = self._engine,

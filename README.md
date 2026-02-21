@@ -36,24 +36,22 @@ python AliceApp.py
 
 ```
 AliceApp/
-├─ AliceApp.py          # エントリポイント
-├─ .env                 # 環境設定（Git管理外）
-├─ .env.example         # 設定テンプレート
+├─ AliceApp.py               # エントリポイント（起動制御・実行シーケンス管理）
+├─ .env                      # 環境設定（Git管理外）
+├─ .env.example              # 設定テンプレート
 ├─ requirements.txt
 │
-├─ module/              # 外装モジュール（物理操作担当）
-│   ├─ env_binder_module.py
-│   ├─ neural_loader_module.py
-│   ├─ prompt_shaper_module.py
-│   └─ result_log_module.py
+├─ module/                   # 外装モジュール（物理操作担当）
+│   ├─ env_binder_module.py         # .env 読み込み・設定値提供
+│   ├─ neural_loader_module.py      # Gemini クライアントロード・検証
+│   ├─ prompt_shaper_module.py      # ペイロード構築・Message 型定義
+│   ├─ result_log_module.py         # 履歴永続化（JSON）・コンソール出力
+│   ├─ display_mode_module.py       # テーマ・レイアウト・アニメーション定義
+│   └─ window_module.py             # メインウィンドウ・各ダイアログ
 │
-├─ src/
-│   └─ AI/
-│       └─ heart.py     # AI推論の心臓部（中層構造）
-│
-└─ gui/
-    ├─ gui_mode.py
-    └─ gui_windows.py
+└─ src/
+    └─ AI/
+        └─ heart.py          # AI推論の心臓部（中層構造・外部依存なし）
 ```
 
 ## 設計原則
@@ -62,9 +60,18 @@ AliceApp/
 - 単方向データフロー（逆流禁止）
 - モジュール責務の厳格分離
 - 環境変数は `env_binder_module` 経由でのみ取得
+- 外装モジュールは末尾に `_module` を必ず付与
+
+## 責務分離マトリクス
+
+| モジュール               | 物理処理 | 設定参照 | 推論 | 永続化 |
+|--------------------------|----------|----------|------|--------|
+| module/                  | ○        | ○        | ×    | ○      |
+| src/AI/heart.py          | ×        | ×        | ○    | ×      |
+| AliceApp.py              | 制御のみ | ×        | ×    | ×      |
 
 ## Git運用
 
 - ブランチは常に `testbranch` を使用
-- commit は GUI から実行可能
+- commit は GUI メニュー → Git から実行可能
 - push（sync）はユーザーが手動で実行
