@@ -398,13 +398,6 @@ class ImageBuilderDialog(tk.Toplevel):
                  bg=c.bg_primary, fg=c.accent_primary,
                  font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
 
-        if not img_builder.is_rembg_available():
-            tk.Label(self,
-                     text="⚠ rembg 未インストール。背景除去はスキップされます。"
-                          "  pip install rembg",
-                     bg=c.bg_primary, fg=c.accent_warning,
-                     font=("Segoe UI", 9)).pack(anchor="w", padx=14)
-
         # ── シート選択 ──
         sf = tk.Frame(self, bg=c.bg_primary); sf.pack(fill="x", padx=14, pady=4)
         tk.Label(sf, text="シートファイル:", bg=c.bg_primary, fg=c.text_secondary,
@@ -725,7 +718,7 @@ class AliceMainWindow:
         char_loader=None,
     ) -> None:
         self._env         = env_binder
-        self._alice       = alice_engine   # AliceEngine (AliceApp.py が管理)
+        self._alice       = alice_engine
         self._voice       = voice_engine
         self._git         = git_manager
         self._char_loader = char_loader
@@ -1114,7 +1107,6 @@ class AliceMainWindow:
         def on_complete(results):
             success = sum(1 for v in results.values() if v)
             if success > 0:
-                # 画像を再読み込みしてキャラクターを更新
                 self._reload_character()
                 self._update_status(f"画像ビルド完了: {success}件 assets/images/ に保存しました。")
         ImageBuilderDialog(self.root, self._env, on_complete=on_complete)
