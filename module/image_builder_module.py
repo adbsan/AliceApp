@@ -54,15 +54,20 @@ except ImportError:
     _PIL_AVAILABLE = False
     logger.error("Pillow が未インストールです。pip install Pillow を実行してください。")
 
-try:
-    from rembg import remove as rembg_remove
-    _REMBG_AVAILABLE = True
-except ImportError:
-    _REMBG_AVAILABLE = False
-    logger.warning(
-        "rembg が未インストールです。背景除去はスキップされます。"
-        " pip install rembg でインストールしてください。"
-    )
+# rembg はモジュールレベルでインポートしない。
+# import するだけで "No onnxruntime backend found." が stdout に出るため、
+# 実際に使用する直前に遅延インポートして制御する。
+_REMBG_AVAILABLE: bool = False  # _check_rembg() で初期化
+
+def _check_rembg() -> bool:
+    """rembg が実際に使用可能かを確認する（遅延・キャッシュ）。"""
+    global _REMBG_AVAILABLE
+    try:
+        import rembg  # noqa: F401
+        _REMBG_AVAILABLE = True
+    except (ImportError, Exception):
+        _REMBG_AVAILABLE = False
+    return _REMBG_AVAILABLE
 
 
 # ============================================================
@@ -244,13 +249,15 @@ class ImageBuilder:
     def _remove_bg(self, img: "Image.Image") -> "Image.Image":
         """
         rembg で背景を除去する。
-        rembg 未インストールの場合はそのまま返す。
+        rembg 未インストール / バックエンド未設定の場合はそのまま返す。
+        ★ 遅延インポート: 起動時ではなく実行時に初めて rembg を読み込む。
         """
-        if not _REMBG_AVAILABLE:
-            logger.debug("rembg 未利用。背景除去をスキップします。")
+        if not _check_rembg():
+            logger.debug("rembg 利用不可。背景除去をスキップします。")
             return img
         try:
             import io
+            from rembg import remove as rembg_remove
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
@@ -291,8 +298,8 @@ def is_available() -> bool:
     return _PIL_AVAILABLE
 
 def is_rembg_available() -> bool:
-    """rembg が利用可能か確認する。"""
-    return _REMBG_AVAILABLE
+    """rembg が実際に利用可能か確認する。"""
+    return _check_rembg()
 
 def get_output_size() -> int:
     """正規化後の出力サイズ（px）を返す。"""
