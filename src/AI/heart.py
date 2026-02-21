@@ -45,7 +45,7 @@ class AliceHeart:
     AI推論の心臓部クラス。
 
     Usage:
-        heart = AliceHeart(client=gemini_client, model_name="gemini-2.0-flash")
+        heart = AliceHeart(client=gemini_client, model_name=model_name)  # model_name は neural_loader_module から渡される
         result = heart.execute(payload)
     """
 
@@ -57,7 +57,7 @@ class AliceHeart:
         """
         self._client = client
         self._model_name = model_name
-        logger.info(f"AliceHeart 初期化完了: model={model_name}")
+        logger.info(f"AliceHeart 初期化完了 (APIキー・モデル検証済み): model={model_name}")
 
     # ============================================================
     # 主要メソッド（直列処理パイプライン）

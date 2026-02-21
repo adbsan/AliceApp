@@ -541,15 +541,29 @@ class AliceApp:
             logger.warning(".env の読み込みに失敗しました。デフォルト設定で動作します。")
 
     def _ensure_model(self) -> tuple:
+        """
+        モデルをロードし、APIキーとモデル名の実際の有効性を確認する。
+
+        ★ 修正: load() 内で APIキー検証済み。
+                verify_model() の真偽値（valid）を使い、
+                検証失敗時は False を返して AliceHeart を生成させない。
+
+        Returns:
+            (success: bool, client, model_name: str)
+        """
         ok, client, model_name = neural.load()
         if not ok:
+            logger.error("Gemini クライアントのロードに失敗しました。チャット機能は無効化されます。")
             return False, None, ""
+
+        # load() 内で検証済みのためキャッシュから即返却
         valid, msg = neural.verify_model()
         if valid:
             logger.info(f"モデル検証OK: {msg}")
+            return True, client, model_name
         else:
-            logger.warning(f"モデル検証警告: {msg}")
-        return ok, client, model_name
+            logger.error(f"モデル検証失敗: {msg} → チャット機能を無効化します。")
+            return False, None, ""
 
     def _init_voice(self) -> Optional[VoiceEngine]:
         try:
