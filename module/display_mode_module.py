@@ -143,7 +143,7 @@ class LayoutConfig:
 LAYOUT_DESKTOP = LayoutConfig(
     min_width=900, min_height=600,
     default_width=1280, default_height=800,
-    char_panel_width=380, char_size=(320, 580),
+    char_panel_width=540, char_size=(512, 512),
 )
 
 LAYOUT_CHARACTER = LayoutConfig(
@@ -153,7 +153,7 @@ LAYOUT_CHARACTER = LayoutConfig(
     show_sidebar=False,
     show_status_bar=False,
     show_toolbar=False,
-    char_panel_width=380, char_size=(280, 480),
+    char_panel_width=540, char_size=(512, 512),
     chat_font_size=12, input_height=60,
 )
 
