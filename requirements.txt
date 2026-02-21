@@ -1,12 +1,13 @@
 # Alice AI - Requirements
 # Python 3.11.0
+# 注意: rembg を削除し numpy を追加（BFSフラッドフィル背景除去に使用）
 
 google-genai>=0.8.0
 python-dotenv>=1.0.0
 Pillow>=10.0.0
+numpy>=1.24.0
 requests>=2.31.0
 GitPython>=3.1.40
 loguru>=0.7.2
 pygame>=2.6.0
-rembg[cpu]>=2.0.50
 typing_extensions>=4.8.0
