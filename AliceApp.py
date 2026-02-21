@@ -311,8 +311,29 @@ class GitManager:
 class VoiceEngine:
     """VOICEVOX を使った音声出力エンジン。"""
 
+    # コード・記号ブロックを除去する正規表現パターン
+    _CODE_PATTERNS = [
+        # フェンスドコードブロック（```～```）
+        (r"```[\s\S]*?```", ""),
+        # インラインコード（`～`）
+        (r"`[^`]+`", ""),
+        # Markdown 見出し記号
+        (r"^#{1,6}\s*", ""),
+        # 箇条書き記号
+        (r"^[\*\-\+]\s+", ""),
+        # 番号付きリスト
+        (r"^\d+\.\s+", ""),
+        # Bold/Italic
+        (r"\*{1,3}([^\*]+)\*{1,3}", r"\1"),
+        # URL
+        (r"https?://\S+", ""),
+        # 連続する記号（3文字以上）
+        (r"[=\-_#\*]{3,}", ""),
+    ]
+
     def __init__(self) -> None:
         self._is_speaking = False
+        self._stop_flag = False
         self._lock = threading.Lock()
         self._voicevox_url = env.get("VOICEVOX_URL")
         self._speaker_id   = int(env.get("VOICEVOX_SPEAKER_ID"))
@@ -326,31 +347,66 @@ class VoiceEngine:
             self._requests_available = True
         except ImportError:
             self._requests_available = False
+            logger.warning("requests が未インストールです。VOICEVOX通信ができません。")
 
         try:
             import pygame
-            pygame.mixer.pre_init(44100, -16, 2, 512)
-            pygame.mixer.init()
-            self._pygame_available = True
         except ImportError:
             self._pygame_available = False
-            logger.warning("pygame が利用できません。音声再生は無効です。")
+            logger.info("pygame 未インストール。winsound にフォールバックします。")
+        else:
+            # import 成功 → mixer 初期化を別途試みる
+            try:
+                pygame.mixer.pre_init(44100, -16, 2, 512)
+                pygame.mixer.init()
+                self._pygame_available = True
+                logger.info("pygame 音声エンジンを初期化しました。")
+            except Exception as e:
+                self._pygame_available = False
+                logger.warning(
+                    f"pygame はインストール済みですが mixer の初期化に失敗しました: {e}"
+                    " → 音声デバイス未接続か仮想環境の再起動が必要な可能性があります。"
+                    " winsound にフォールバックします。"
+                )
 
     @property
     def is_speaking(self) -> bool:
         return self._is_speaking
 
     def speak(self, text: str) -> None:
-        if not self._requests_available or not text.strip():
+        """テキストを読み上げる。コードブロック・記号は除去して文章のみ読む。"""
+        if not self._requests_available:
+            logger.warning("requests 未インストールのため音声読み上げをスキップします。")
             return
-        threading.Thread(target=self._speak_thread, args=(text,), daemon=True).start()
+        cleaned = self._clean_text(text)
+        if not cleaned.strip():
+            return
+        threading.Thread(target=self._speak_thread, args=(cleaned,), daemon=True).start()
+
+    def _clean_text(self, text: str) -> str:
+        """
+        読み上げ用テキストの前処理。
+        コードブロック・Markdown記号・URLを除去し、文章のみを残す。
+        """
+        import re
+        result = text
+        for pattern, replacement in self._CODE_PATTERNS:
+            result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
+        # 空行の連続を1行に圧縮
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        # 行頭・行末の空白除去
+        lines = [line.strip() for line in result.splitlines()]
+        # 空行だけの行を除去してから結合
+        result = " ".join(line for line in lines if line)
+        return result.strip()
 
     def _speak_thread(self, text: str) -> None:
         with self._lock:
             self._is_speaking = True
+            self._stop_flag = False
             try:
                 wav = self._text_to_wav(text)
-                if wav:
+                if wav and not self._stop_flag:
                     self._play_wav(wav)
             except Exception as e:
                 logger.error(f"音声再生エラー: {e}")
@@ -358,6 +414,8 @@ class VoiceEngine:
                 self._is_speaking = False
 
     def stop(self) -> None:
+        """再生中の音声を停止する。"""
+        self._stop_flag = True
         if self._pygame_available:
             try:
                 import pygame
@@ -384,45 +442,76 @@ class VoiceEngine:
                 timeout=10,
             )
             if query_resp.status_code != 200:
+                logger.error(f"audio_query 失敗: {query_resp.status_code}")
                 return None
             query = query_resp.json()
             query["speedScale"]      = self._speed
             query["pitchScale"]      = self._pitch
             query["intonationScale"] = self._intonation
             query["volumeScale"]     = self._volume
+            # synthesis のタイムアウトをテキスト長に応じて動的に設定
+            timeout = max(30, len(text) // 10)
             synth_resp = requests.post(
                 f"{self._voicevox_url}/synthesis",
                 params={"speaker": self._speaker_id},
                 headers={"Content-Type": "application/json"},
                 data=json.dumps(query),
-                timeout=30,
+                timeout=timeout,
             )
-            return synth_resp.content if synth_resp.status_code == 200 else None
+            if synth_resp.status_code != 200:
+                logger.error(f"synthesis 失敗: {synth_resp.status_code}")
+                return None
+            return synth_resp.content
         except Exception as e:
             logger.error(f"WAV 生成エラー: {e}")
             return None
 
     def _play_wav(self, wav_data: bytes) -> None:
         if self._pygame_available:
-            import io
-            import pygame
-            sound = pygame.mixer.Sound(io.BytesIO(wav_data))
-            sound.set_volume(self._volume)
-            channel = sound.play()
-            while channel.get_busy():
-                pygame.time.wait(50)
-        else:
             try:
-                import os
-                import tempfile
-                import winsound
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    f.write(wav_data)
-                    tmp = f.name
-                winsound.PlaySound(tmp, winsound.SND_FILENAME)
-                os.unlink(tmp)
+                import io
+                import pygame
+                sound = pygame.mixer.Sound(io.BytesIO(wav_data))
+                sound.set_volume(self._volume)
+                channel = sound.play()
+                # 再生完了まで待機（stop_flag で中断可能）
+                while channel.get_busy():
+                    if self._stop_flag:
+                        channel.stop()
+                        break
+                    pygame.time.wait(50)
             except Exception as e:
-                logger.error(f"winsound 再生エラー: {e}")
+                logger.error(f"pygame 再生エラー: {e}")
+                self._play_wav_winsound(wav_data)
+        else:
+            self._play_wav_winsound(wav_data)
+
+    def _play_wav_winsound(self, wav_data: bytes) -> None:
+        """
+        winsound を使った再生。
+        ★ 修正: SND_SYNC フラグで再生完了まで待機してからファイル削除。
+                SND_FILENAME（非同期）だとファイル削除タイミングが早すぎて途中停止する。
+        """
+        import os
+        import tempfile
+        tmp = None
+        try:
+            import winsound
+            # delete=False で作成し、再生完了後に手動削除
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(wav_data)
+                tmp = f.name
+            # SND_FILENAME | SND_SYNC = 同期再生（完了まで待機）
+            winsound.PlaySound(tmp, winsound.SND_FILENAME | winsound.SND_SYNC)
+        except Exception as e:
+            logger.error(f"winsound 再生エラー: {e}")
+        finally:
+            # 再生完了後に削除（stop_flag でも安全に削除）
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
 
 
 # ============================================================
