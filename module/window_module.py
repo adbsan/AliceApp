@@ -730,8 +730,14 @@ class AliceMainWindow:
     # ---- サービス起動 ----
 
     def _start_services(self):
-        self.root.after(200, self._load_character)
-        self.root.after(600, self._show_greeting)
+        # キャラクター読み込みは 800ms 後に開始する。
+        # CharacterLoader.initialize() がバックグラウンドで preload を
+        # 走らせており、200ms では競合してキャッシュが空のまま
+        # get_image() が呼ばれる場合があった。
+        # get_image() はキャッシュになければファイルから直接読み込むため
+        # 結果は正しいが、遅延を増やすことで preload 完了後に参照できるようにする。
+        self.root.after(800, self._load_character)
+        self.root.after(1200, self._show_greeting)
 
     def _load_character(self):
         if not self._char_loader or not hasattr(self, "_animator"):
@@ -740,9 +746,7 @@ class AliceMainWindow:
             images = {}
             for state in ("default", "idle", "speaking", "thinking", "greeting"):
                 img = self._char_loader.get_image(state)
-                if img is None and state != "default":
-                    img = self._char_loader.get_image("default")
-                if img:
+                if img is not None:
                     images[state] = img
             self._enqueue(self._on_character_loaded, images)
         threading.Thread(target=_load, daemon=True).start()
@@ -909,8 +913,9 @@ class AliceMainWindow:
             messagebox.showwarning("VOICEVOX", "VoiceEngine が初期化されていません。")
 
     def _open_logs(self):
-        logs = Path("logs").resolve()
-        logs.mkdir(exist_ok=True)
+        from module import result_log_module as _rl
+        logs = _rl.get_logs_dir()
+        logs.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(f'explorer "{logs}"', shell=True)
 
     def _show_about(self):

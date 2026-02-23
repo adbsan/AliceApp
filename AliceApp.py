@@ -9,14 +9,6 @@ AliceApp.py
   4. Process Input    - prompt_shaper_module でペイロードを構築
   5. Core Execution   - heart.execute() で推論
   6. Handle Output    - result_log_module で永続化
-
-修正:
-  - _ensure_model(): load() 内で検証済みのため重複していた
-    verify_model() 呼び出しを削除し、API を2回叩くバグを修正。
-  - VoiceEngine._CODE_PATTERNS: 毎回 re.sub() のたびにパターンを
-    コンパイルしていた箇所を re.compile() で事前コンパイルに変更。
-  - CharacterLoader.initialize(): 画像プリロードをメインスレッドで
-    ブロッキング実行していた箇所をバックグラウンドスレッドに移動。
 """
 
 from __future__ import annotations
@@ -64,10 +56,7 @@ from src.AI.heart import AliceHeart
 # ============================================================
 
 class AliceEngine:
-    """
-    heart.py を呼び出すパイプラインコントローラ。
-    GUI から操作されるが、推論の詳細は heart.py に完全委譲する。
-    """
+    """heart.py を呼び出すパイプラインコントローラ。"""
 
     def __init__(self, heart: AliceHeart) -> None:
         self._heart = heart
@@ -84,11 +73,9 @@ class AliceEngine:
         on_complete: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
-        """ユーザー入力を受け取り推論パイプラインを実行する。"""
         if not user_input.strip():
             return
 
-        # Step 4: Process Input
         self._history.append(shaper.new_message("user", user_input))
         payload = shaper.build_payload(
             user_input=user_input,
@@ -98,10 +85,8 @@ class AliceEngine:
             temperature=0.9,
         )
 
-        # Step 5: Core Execution
         result = self._heart.execute(payload, on_chunk=on_chunk)
 
-        # Step 6: Handle Output
         if result["success"]:
             response = result["response"]
             self._history.append(shaper.new_message("assistant", response))
@@ -115,7 +100,6 @@ class AliceEngine:
                 on_error(result["error"] or "不明なエラーが発生しました。")
 
     def get_greeting(self) -> str:
-        """起動時の挨拶を返す（API節約のためローカル生成）。"""
         name = env.get("ALICE_NAME")
         msg = (
             f"こんにちは！私は {name} です。\n"
@@ -141,14 +125,11 @@ class AliceEngine:
 # ============================================================
 
 class GitManager:
-    """Git操作の外装モジュール。testbranch への commit を管理する。"""
-
     TARGET_BRANCH = "testbranch"
 
     def __init__(self, repo_path: str = ".") -> None:
         self._repo_path = Path(repo_path).resolve()
         self._repo = None
-
         try:
             import git
             from git import InvalidGitRepositoryError, Repo
@@ -320,18 +301,16 @@ class GitManager:
 class VoiceEngine:
     """VOICEVOX を使った音声出力エンジン。"""
 
-    # 修正: コード・記号ブロックを除去する正規表現を re.compile() で
-    #       事前コンパイルし、speak() 呼び出しごとの再コンパイルを排除。
-    #       各エントリは (compiled_pattern, replacement) のタプル。
+    # 事前コンパイル済み正規表現パターン
     _CODE_PATTERNS = [
-        (re.compile(r"```[\s\S]*?```"),          ""),       # フェンスドコードブロック
-        (re.compile(r"`[^`]+`"),                 ""),       # インラインコード
-        (re.compile(r"^#{1,6}\s*", re.M),        ""),       # Markdown 見出し
-        (re.compile(r"^[\*\-\+]\s+", re.M),     ""),       # 箇条書き記号
-        (re.compile(r"^\d+\.\s+", re.M),        ""),       # 番号付きリスト
-        (re.compile(r"\*{1,3}([^\*]+)\*{1,3}"), r"\1"),    # Bold/Italic
-        (re.compile(r"https?://\S+"),            ""),       # URL
-        (re.compile(r"[=\-_#\*]{3,}"),           ""),       # 連続する記号（3文字以上）
+        (re.compile(r"```[\s\S]*?```"),          ""),
+        (re.compile(r"`[^`]+`"),                 ""),
+        (re.compile(r"^#{1,6}\s*", re.M),        ""),
+        (re.compile(r"^[\*\-\+]\s+", re.M),     ""),
+        (re.compile(r"^\d+\.\s+", re.M),        ""),
+        (re.compile(r"\*{1,3}([^\*]+)\*{1,3}"), r"\1"),
+        (re.compile(r"https?://\S+"),            ""),
+        (re.compile(r"[=\-_#\*]{3,}"),           ""),
     ]
 
     def __init__(self) -> None:
@@ -365,20 +344,14 @@ class VoiceEngine:
                 logger.info("pygame 音声エンジンを初期化しました。")
             except Exception as e:
                 self._pygame_available = False
-                logger.warning(
-                    f"pygame はインストール済みですが mixer の初期化に失敗しました: {e}"
-                    " → 音声デバイス未接続か仮想環境の再起動が必要な可能性があります。"
-                    " winsound にフォールバックします。"
-                )
+                logger.warning(f"pygame mixer 初期化失敗: {e} → winsound にフォールバックします。")
 
     @property
     def is_speaking(self) -> bool:
         return self._is_speaking
 
     def speak(self, text: str) -> None:
-        """テキストを読み上げる。コードブロック・記号は除去して文章のみ読む。"""
         if not self._requests_available:
-            logger.warning("requests 未インストールのため音声読み上げをスキップします。")
             return
         cleaned = self._clean_text(text)
         if not cleaned.strip():
@@ -386,20 +359,12 @@ class VoiceEngine:
         threading.Thread(target=self._speak_thread, args=(cleaned,), daemon=True).start()
 
     def _clean_text(self, text: str) -> str:
-        """
-        読み上げ用テキストの前処理。
-        コードブロック・Markdown記号・URLを除去し、文章のみを残す。
-
-        修正: 事前コンパイル済みパターンを使用して処理を高速化。
-        """
         result = text
         for pattern, replacement in self._CODE_PATTERNS:
             result = pattern.sub(replacement, result)
-        # 空行の連続を1行に圧縮
         result = re.sub(r"\n{3,}", "\n\n", result)
         lines = [line.strip() for line in result.splitlines()]
-        result = " ".join(line for line in lines if line)
-        return result.strip()
+        return " ".join(line for line in lines if line).strip()
 
     def _speak_thread(self, text: str) -> None:
         with self._lock:
@@ -415,7 +380,6 @@ class VoiceEngine:
                 self._is_speaking = False
 
     def stop(self) -> None:
-        """再生中の音声を停止する。"""
         self._stop_flag = True
         if self._pygame_available:
             try:
@@ -510,7 +474,15 @@ class VoiceEngine:
 # ============================================================
 
 class CharacterLoader:
-    """キャラクター画像ファイルを読み込む外装モジュール。"""
+    """
+    キャラクター画像ファイルを読み込む外装モジュール。
+
+    修正点:
+      - initialize() をバックグラウンドスレッドで実行（非ブロッキング）
+      - 起動時に検索ディレクトリと各ファイルの有無を INFO ログに出力
+      - 指定ポーズの PNG が存在しない場合は alice_default.png で代替
+      - get_image() のスレッドセーフ性を強化
+    """
 
     _POSE_MAP = {
         "default":  "alice_default",
@@ -525,46 +497,91 @@ class CharacterLoader:
         self._lock = threading.Lock()
         self._images_dir = ROOT_DIR / "assets" / "images"
         self._images_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"CharacterLoader: 画像ディレクトリ = {self._images_dir}")
 
     def initialize(self) -> None:
-        """
-        画像プリロードをバックグラウンドスレッドで実行する。
-
-        修正: 元の実装はメインスレッドで _preload() を呼び出しており、
-              画像ファイルが存在する場合に起動をブロッキングしていた。
-              スレッド化することで GUI の初期表示を妨げない。
-        """
+        """バックグラウンドで全ポーズ画像をプリロードする（非ブロッキング）。"""
         threading.Thread(target=self._preload, daemon=True).start()
 
     def get_image(self, state: str = "default"):
+        """
+        指定ステートの画像を返す。
+        指定ポーズが存在しない場合は alice_default で代替する。
+        """
         if not self._pil_available():
+            logger.error("CharacterLoader: Pillow が利用できません。pip install Pillow")
             return None
+
         with self._lock:
             if state in self._cache:
                 return self._cache[state]
-        fname = self._POSE_MAP.get(state, "alice_default")
-        path = self._images_dir / f"{fname}.png"
-        if path.exists():
-            try:
-                from PIL import Image
-                img = Image.open(path).convert("RGBA")
-                with self._lock:
-                    self._cache[state] = img
-                return img
-            except Exception as e:
-                logger.error(f"画像読み込みエラー ({fname}): {e}")
-        return None
+
+        # キャッシュになければファイルから読み込む
+        img = self._load_from_file(state)
+        if img is None and state != "default":
+            img = self._load_from_file("default")
+
+        if img is not None:
+            with self._lock:
+                self._cache[state] = img
+
+        return img
 
     def reload(self) -> None:
         with self._lock:
             self._cache.clear()
         threading.Thread(target=self._preload, daemon=True).start()
+        logger.info("CharacterLoader: キャッシュクリア、再読み込み開始")
+
+    # ---- 内部処理 ----
+
+    def _load_from_file(self, state: str):
+        """指定ステートの PNG を読み込んで返す。失敗時は None。"""
+        try:
+            from PIL import Image
+        except ImportError:
+            return None
+
+        fname = self._POSE_MAP.get(state, "alice_default")
+        path = self._images_dir / f"{fname}.png"
+
+        if not path.exists():
+            logger.debug(f"CharacterLoader: ファイルなし → {path}")
+            return None
+
+        try:
+            img = Image.open(path).convert("RGBA")
+            logger.debug(
+                f"CharacterLoader: 読み込み成功 [{state}] "
+                f"{path.name} ({img.width}x{img.height})"
+            )
+            return img
+        except Exception as e:
+            logger.error(f"CharacterLoader: 読み込みエラー [{state}] {path}: {e}")
+            return None
 
     def _preload(self) -> None:
         """全ポーズ画像をバックグラウンドでキャッシュに読み込む。"""
+        logger.info(f"CharacterLoader: プリロード開始 ({self._images_dir})")
+
+        found, missing = [], []
+        for state, fname in self._POSE_MAP.items():
+            path = self._images_dir / f"{fname}.png"
+            (found if path.exists() else missing).append(fname)
+
+        logger.info(f"CharacterLoader: 検出ファイル  = {found}")
+        if missing:
+            logger.warning(
+                f"CharacterLoader: 未検出ファイル = {missing} "
+                "→ alice_default.png で代替します"
+            )
+
         for state in self._POSE_MAP:
             self.get_image(state)
-        logger.debug("CharacterLoader: プリロード完了")
+
+        with self._lock:
+            count = len(self._cache)
+        logger.info(f"CharacterLoader: プリロード完了 ({count} ステートをキャッシュ済み)")
 
     def _pil_available(self) -> bool:
         try:
@@ -579,15 +596,7 @@ class CharacterLoader:
 # ============================================================
 
 class AliceApp:
-    """
-    起動シーケンスを管理するエントリポイントクラス。
-
-    実行シーケンス (§5 準拠):
-      1. Load Config
-      2. Ensure Model
-      3. Initialize Heart
-      4-6. AliceEngine が担当（Process Input / Core Execution / Handle Output）
-    """
+    """起動シーケンスを管理するエントリポイントクラス。"""
 
     def __init__(self) -> None:
         self._heart:  Optional[AliceHeart]      = None
@@ -601,19 +610,14 @@ class AliceApp:
         logger.info("Alice AI 起動開始")
         logger.info("=" * 60)
 
-        # Step 1: Load Config
         self._load_config()
-
-        # Step 2: Ensure Model
         ok, client, model_name = self._ensure_model()
 
-        # Step 3: Initialize Heart
         if ok and client:
             self._heart = AliceHeart(client=client, model_name=model_name)
         else:
             logger.warning("モデルが利用できません。チャット機能は無効化されます。")
 
-        # 外装モジュール初期化
         self._engine = AliceEngine(self._heart) if self._heart else None
         if self._engine:
             self._engine.load_history()
@@ -621,9 +625,8 @@ class AliceApp:
         self._voice  = self._init_voice()
         self._git    = GitManager(repo_path=str(ROOT_DIR))
         self._loader = CharacterLoader()
-        self._loader.initialize()   # バックグラウンドで実行（非ブロッキング）
+        self._loader.initialize()
 
-        # GUI 起動
         self._launch_gui()
 
     def _load_config(self) -> None:
@@ -633,23 +636,11 @@ class AliceApp:
             logger.warning(".env の読み込みに失敗しました。デフォルト設定で動作します。")
 
     def _ensure_model(self) -> tuple:
-        """
-        モデルをロードして返す。
-
-        修正: load() の内部で APIキー検証・モデル確認を一括実施済みのため、
-              直後に verify_model() を重複呼び出しして API を二重に叩いていた
-              バグを修正。load() の戻り値のみで判断する。
-
-        Returns:
-            (success: bool, client, model_name: str)
-        """
+        """load() 内で検証済みのため verify_model() 重複呼び出しは行わない。"""
         ok, client, model_name = neural.load()
         if not ok:
             logger.error("Gemini クライアントのロードに失敗しました。チャット機能は無効化されます。")
             return False, None, ""
-
-        # load() 内でAPIキー検証・モデル確認が完了しているため
-        # verify_model() の重複呼び出しは不要（API節約）
         logger.info(f"モデルロードOK: {model_name}")
         return True, client, model_name
 
