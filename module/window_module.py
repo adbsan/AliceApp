@@ -29,7 +29,6 @@ from typing import Callable, Dict, Optional
 
 from loguru import logger
 
-from module import image_builder_module as img_builder
 from module.display_mode_module import (
     AppMode, CharacterState, LayoutConfig, Theme,
     get_layout, DEFAULT_ANIMATION,
@@ -354,242 +353,6 @@ class SettingsDialog(tk.Toplevel):
 
 
 # ================================================================== #
-# 画像ビルダーダイアログ
-# ================================================================== #
-
-class ImageBuilderDialog(tk.Toplevel):
-    """
-    スプライトシートからキャラクター画像を生成するダイアログ。
-
-    操作フロー:
-      1. シートファイルを選択
-      2. 行・列数を入力
-      3. プレビューでセルを確認
-      4. 各セルにポーズ名を割り当て
-      5. ビルド実行 → assets/images/ に保存
-    """
-
-    POSE_NAMES = ["alice_default", "alice_idle", "alice_speaking",
-                  "alice_thinking", "alice_greeting", "(スキップ)"]
-
-    def __init__(self, parent, env_binder, on_complete=None):
-        super().__init__(parent)
-        self._env = env_binder
-        self._on_complete = on_complete
-        self._builder = None
-        self._preview_images = []   # PhotoImage 参照保持（GC対策）
-        self._pose_vars = []        # 各セルのポーズ割り当て変数
-
-        theme_name = env_binder.get("APP_THEME") if env_binder else "dark"
-        c = Theme.get(theme_name)
-        self.title("Alice AI - 画像ビルダー")
-        self.geometry("780x680")
-        self.configure(bg=c.bg_primary)
-        self.transient(parent)
-        self.grab_set()
-        self._c = c
-        self._build_ui(c)
-
-    # ---- UI構築 ----
-
-    def _build_ui(self, c):
-        # ── ヘッダー ──
-        tk.Label(self, text="スプライトシート → キャラクター画像生成",
-                 bg=c.bg_primary, fg=c.accent_primary,
-                 font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
-
-        # ── シート選択 ──
-        sf = tk.Frame(self, bg=c.bg_primary); sf.pack(fill="x", padx=14, pady=4)
-        tk.Label(sf, text="シートファイル:", bg=c.bg_primary, fg=c.text_secondary,
-                 font=("Segoe UI", 10)).pack(side="left")
-        self._sheet_var = tk.StringVar(value="assets/parts/sheet.png")
-        tk.Entry(sf, textvariable=self._sheet_var, bg=c.bg_tertiary, fg=c.text_primary,
-                 insertbackground=c.text_primary, relief="flat", font=("Segoe UI", 10),
-                 highlightthickness=1, highlightbackground=c.border,
-                 width=42).pack(side="left", padx=6, ipady=3)
-        self._btn(sf, c, "参照", self._browse_sheet).pack(side="left")
-
-        # ── グリッド設定 ──
-        gf = tk.Frame(self, bg=c.bg_primary); gf.pack(fill="x", padx=14, pady=4)
-        for label, var_name, default in [("行数", "_rows_var", "2"), ("列数", "_cols_var", "3")]:
-            tk.Label(gf, text=label + ":", bg=c.bg_primary, fg=c.text_secondary,
-                     font=("Segoe UI", 10)).pack(side="left", padx=(0, 4))
-            var = tk.StringVar(value=default)
-            setattr(self, var_name, var)
-            tk.Entry(gf, textvariable=var, bg=c.bg_tertiary, fg=c.text_primary,
-                     insertbackground=c.text_primary, relief="flat",
-                     font=("Segoe UI", 10), width=4,
-                     highlightthickness=1, highlightbackground=c.border).pack(
-                         side="left", padx=(0, 16), ipady=3)
-        self._btn(gf, c, "プレビュー", self._load_preview).pack(side="left")
-
-        # ── プレビュー領域 ──
-        tk.Label(self, text="セルプレビュー（クリックしてポーズ名を割り当て）",
-                 bg=c.bg_primary, fg=c.text_secondary,
-                 font=("Segoe UI", 9, "italic")).pack(anchor="w", padx=14, pady=(8, 2))
-
-        preview_frame = tk.Frame(self, bg=c.bg_secondary,
-                                  highlightthickness=1,
-                                  highlightbackground=c.border)
-        preview_frame.pack(fill="both", expand=True, padx=14, pady=2)
-
-        canvas = tk.Canvas(preview_frame, bg=c.bg_secondary, highlightthickness=0)
-        vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        self._inner = tk.Frame(canvas, bg=c.bg_secondary)
-        self._canvas_window = canvas.create_window((0, 0), window=self._inner, anchor="nw")
-        self._inner.bind("<Configure>",
-                         lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(self._canvas_window, width=e.width))
-        self._preview_inner = self._inner
-
-        # ── 進捗バー ──
-        self._progress_label = tk.Label(self, text="", bg=c.bg_primary,
-                                         fg=c.text_muted, font=("Segoe UI", 9))
-        self._progress_label.pack(anchor="w", padx=14, pady=2)
-        self._progress_bar = ttk.Progressbar(self, mode="determinate")
-        self._progress_bar.pack(fill="x", padx=14, pady=(0, 4))
-
-        # ── ボタン行 ──
-        br = tk.Frame(self, bg=c.bg_primary); br.pack(fill="x", padx=14, pady=(4, 12))
-        self._build_btn = self._btn(br, c, "ビルド実行", self._run_build, c.accent_primary)
-        self._build_btn.pack(side="right", padx=4)
-        self._btn(br, c, "閉じる", self.destroy, c.bg_tertiary, c.text_secondary).pack(side="right")
-
-    # ---- 操作 ----
-
-    def _browse_sheet(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="スプライトシートを選択",
-            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.webp"), ("全て", "*.*")]
-        )
-        if path:
-            self._sheet_var.set(path)
-
-    def _load_preview(self):
-        """シートを読み込みセルプレビューを生成する。"""
-        from PIL import Image, ImageTk
-
-        # 既存プレビューをクリア
-        for w in self._preview_inner.winfo_children():
-            w.destroy()
-        self._preview_images.clear()
-        self._pose_vars.clear()
-
-        try:
-            rows = int(self._rows_var.get())
-            cols = int(self._cols_var.get())
-        except ValueError:
-            messagebox.showerror("入力エラー", "行数・列数は整数で入力してください。", parent=self)
-            return
-
-        sheet_path = self._sheet_var.get()
-        self._builder = img_builder.ImageBuilder(sheet_path, rows=rows, cols=cols)
-        previews = self._builder.preview_cells()
-
-        if not previews:
-            tk.Label(self._preview_inner,
-                     text="シートの読み込みに失敗しました。ファイルパスを確認してください。",
-                     bg=self._c.bg_secondary, fg=self._c.accent_error,
-                     font=("Segoe UI", 10)).pack(padx=10, pady=10)
-            return
-
-        c = self._c
-        thumb_size = 128
-        cols_per_row = max(1, 560 // (thumb_size + 20))
-
-        for i, (cell_idx, img) in enumerate(previews):
-            row_f = tk.Frame(self._preview_inner, bg=c.bg_secondary)
-            row_f.grid(row=i // cols_per_row, column=i % cols_per_row, padx=6, pady=6)
-
-            # サムネイル表示
-            tk_img = ImageTk.PhotoImage(img)
-            self._preview_images.append(tk_img)
-            lbl = tk.Label(row_f, image=tk_img, bg=c.bg_secondary,
-                            relief="flat", cursor="hand2",
-                            highlightthickness=2, highlightbackground=c.border)
-            lbl.pack()
-            tk.Label(row_f, text=f"#{cell_idx}", bg=c.bg_secondary,
-                     fg=c.text_muted, font=("Segoe UI", 8)).pack()
-
-            # ポーズ名割り当てコンボ
-            var = tk.StringVar(value=self.POSE_NAMES[min(i, len(self.POSE_NAMES)-1)])
-            self._pose_vars.append((cell_idx, var))
-            ttk.Combobox(row_f, textvariable=var, values=self.POSE_NAMES,
-                         state="readonly", width=16).pack(pady=2)
-
-    def _run_build(self):
-        """ビルドを実行する。"""
-        if self._builder is None:
-            messagebox.showwarning("未プレビュー",
-                                   "先に「プレビュー」ボタンを押してください。", parent=self)
-            return
-
-        # pose_map 構築（スキップは除外）
-        pose_map = {}
-        for cell_idx, var in self._pose_vars:
-            name = var.get()
-            if name != "(スキップ)":
-                pose_map[cell_idx] = name
-
-        if not pose_map:
-            messagebox.showwarning("割り当てなし",
-                                   "最低1つのセルにポーズ名を割り当ててください。", parent=self)
-            return
-
-        total = len(pose_map)
-        self._progress_bar["maximum"] = total
-        self._progress_bar["value"]   = 0
-        self._build_btn.configure(state="disabled")
-
-        def on_progress(current, total, msg):
-            self.after(0, lambda: self._update_progress(current, total, msg))
-
-        def on_complete(results):
-            self.after(0, lambda: self._on_build_complete(results))
-
-        self._builder.build_async(
-            pose_map=pose_map,
-            on_progress=on_progress,
-            on_complete=on_complete,
-        )
-
-    def _update_progress(self, current, total, msg):
-        self._progress_bar["value"] = current
-        self._progress_label.configure(text=msg)
-
-    def _on_build_complete(self, results):
-        self._build_btn.configure(state="normal")
-        success = sum(1 for v in results.values() if v)
-        fail    = len(results) - success
-        self._progress_label.configure(
-            text=f"完了: {success}件成功 / {fail}件失敗"
-        )
-        msg = f"ビルド完了！\n成功: {success}件 / 失敗: {fail}件"
-        if fail == 0:
-            messagebox.showinfo("完了", msg, parent=self)
-        else:
-            failed_names = [k for k, v in results.items() if not v]
-            messagebox.showwarning(
-                "一部失敗", msg + f"\n失敗: {', '.join(failed_names)}", parent=self
-            )
-        if self._on_complete:
-            self._on_complete(results)
-
-    def _btn(self, parent, c, text, cmd, bg=None, fg=None):
-        return tk.Button(parent, text=text, command=cmd,
-                         bg=bg or self._c.accent_primary,
-                         fg=fg or self._c.text_primary,
-                         relief="flat", font=("Segoe UI", 10),
-                         padx=12, pady=5, cursor="hand2",
-                         activebackground=self._c.bg_hover)
-
-
-# ================================================================== #
 # Git ダイアログ
 # ================================================================== #
 
@@ -707,7 +470,15 @@ class AliceMainWindow:
     """
     AliceApp のメインGUIウィンドウ。
     AliceApp.py から各エンジンを受け取り、表示と操作を担当する。
+
+    レイアウト: ttk.PanedWindow によるリサイズ可能な 左右分割
+      - 左ペイン（チャット）: 初期比率 65%
+      - 右ペイン（キャラクター）: 初期比率 35%
     """
+
+    # 左右ペインの初期幅比率（チャット : キャラクター）
+    _CHAT_RATIO   = 0.62
+    _CHAR_RATIO   = 0.38
 
     def __init__(
         self,
@@ -799,11 +570,10 @@ class AliceMainWindow:
 
         # ツール
         tm = menu(menubar)
-        tm.add_command(label="画像ビルダー",          command=self._open_image_builder)
         tm.add_command(label="キャラクター再読み込み", command=self._reload_character)
-        tm.add_command(label="VOICEVOX 接続確認",    command=self._check_voicevox)
+        tm.add_command(label="VOICEVOX 接続確認",     command=self._check_voicevox)
         tm.add_separator()
-        tm.add_command(label="ログフォルダを開く",   command=self._open_logs)
+        tm.add_command(label="ログフォルダを開く",    command=self._open_logs)
         menubar.add_cascade(label="ツール", menu=tm)
 
         # ヘルプ
@@ -819,21 +589,40 @@ class AliceMainWindow:
     def _build_desktop_ui(self):
         c = self.colors
         layout = get_layout(AppMode.DESKTOP)
-        main = tk.Frame(self.root, bg=c.bg_primary)
-        main.pack(fill="both", expand=True)
 
-        chat_area = tk.Frame(main, bg=c.bg_primary)
-        chat_area.pack(side="left", fill="both", expand=True)
-        self._build_header(chat_area, c)
-        self._build_chat_display(chat_area, c)
-        self._build_input_area(chat_area, c)
+        # ── PanedWindow でチャット / キャラクターを左右に分割 ──────────
+        # sashrelief="flat" + sashwidth=6 でスリムな仕切り線
+        self._paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self._paned.pack(fill="both", expand=True)
 
-        char_area = tk.Frame(main, bg=c.bg_secondary, width=layout.char_panel_width)
-        char_area.pack(side="right", fill="y")
-        char_area.pack_propagate(False)
-        self._build_character_panel(char_area, c, layout)
+        # 左ペイン: チャットエリア
+        chat_frame = tk.Frame(self._paned, bg=c.bg_primary)
+        self._paned.add(chat_frame, weight=62)
+
+        self._build_header(chat_frame, c)
+        self._build_chat_display(chat_frame, c)
+        self._build_input_area(chat_frame, c)
+
+        # 右ペイン: キャラクターエリア
+        char_frame = tk.Frame(self._paned, bg=c.bg_secondary)
+        self._paned.add(char_frame, weight=38)
+
+        self._build_character_panel(char_frame, c, layout)
+
+        # 初期サッシ位置を遅延設定（ウィンドウ描画後に実行）
+        self.root.after(50, self._set_initial_sash)
 
         self._build_status_bar(c)
+
+    def _set_initial_sash(self):
+        """ウィンドウ幅に応じてサッシ初期位置を設定する。"""
+        try:
+            total = self.root.winfo_width()
+            if total > 10:
+                sash_pos = int(total * self._CHAT_RATIO)
+                self._paned.sashpos(0, sash_pos)
+        except Exception:
+            pass
 
     def _build_header(self, parent, c):
         h = tk.Frame(parent, bg=c.bg_secondary, height=52)
@@ -917,7 +706,6 @@ class AliceMainWindow:
                  font=("Segoe UI", 12, "bold")).pack(pady=(6, 2))
         self._char_canvas = tk.Canvas(
             f, bg=c.bg_secondary, highlightthickness=0,
-            width=layout.char_size[0], height=layout.char_size[1]
         )
         self._char_canvas.pack(fill="both", expand=True)
         self._animator = CharacterAnimator(self._char_canvas)
@@ -978,6 +766,7 @@ class AliceMainWindow:
         if not (event.state & 0x1):
             self._on_send()
             return "break"
+        return None
 
     def _on_send(self):
         text = self._input_box.get_text()
@@ -1102,14 +891,6 @@ class AliceMainWindow:
         if b:
             ok, msg = self._git.switch_branch(b)
             messagebox.showinfo("ブランチ", msg)
-
-    def _open_image_builder(self):
-        def on_complete(results):
-            success = sum(1 for v in results.values() if v)
-            if success > 0:
-                self._reload_character()
-                self._update_status(f"画像ビルド完了: {success}件 assets/images/ に保存しました。")
-        ImageBuilderDialog(self.root, self._env, on_complete=on_complete)
 
     def _reload_character(self):
         if not self._char_loader:

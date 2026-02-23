@@ -46,10 +46,6 @@ def load() -> Tuple[bool, Optional[object], str]:
     Gemini クライアントをロードし、APIキーとモデルの実動作を確認して返す。
     2回目以降はキャッシュを返す（再接続不要）。
 
-    ★ 修正: クライアント生成だけでなく、APIキーが実際に有効かを
-            小さなリクエストで確認してからキャッシュする。
-            APIキー無効時は False を返し AliceHeart を生成させない。
-
     Returns:
         (success: bool, client: genai.Client | None, model_name: str)
     """
@@ -71,8 +67,6 @@ def load() -> Tuple[bool, Optional[object], str]:
         client = genai.Client(api_key=api_key)
 
         # ── APIキーの実際の有効性チェック ──────────────────────────
-        # models.list() を呼ぶことで 400/401 をここで捕捉する。
-        # クライアント生成自体はAPIキーが無効でも成功してしまうため必須。
         try:
             model_list = list(client.models.list())
             model_ids = [m.name for m in model_list]
@@ -81,7 +75,7 @@ def load() -> Tuple[bool, Optional[object], str]:
             if "API_KEY_INVALID" in err_str or "400" in err_str or "401" in err_str:
                 logger.error(f"APIキーが無効です: {api_err}")
                 return False, None, ""
-            raise  # 予期しないエラーは再 raise
+            raise
 
         # ── モデル存在確認 ─────────────────────────────────────────
         full_name = f"models/{model}"
@@ -148,10 +142,16 @@ def verify_model() -> Tuple[bool, str]:
 
 
 def reset() -> None:
-    """クライアントキャッシュをリセットする（設定変更後の再初期化用）。"""
-    global _client, _model_name
+    """
+    クライアントキャッシュをリセットする（設定変更後の再初期化用）。
+
+    修正: _verified フラグも同時にリセットし、次回 load() 時に
+          APIキー・モデルが正しく再検証されるようにした。
+    """
+    global _client, _model_name, _verified
     _client = None
     _model_name = ""
+    _verified = False  # ← 修正: リセット漏れを修正
     logger.debug("neural_loader_module: キャッシュをリセットしました。")
 
 

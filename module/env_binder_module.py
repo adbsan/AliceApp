@@ -16,6 +16,7 @@ env_binder_module.py
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 from loguru import logger
@@ -58,6 +59,22 @@ _ENV_SCHEMA: Dict[str, Dict[str, Any]] = {
 # ============================================================
 _loaded: bool = False
 _env_path: Optional[Path] = None
+
+# キー名マッチ用パターンをモジュールロード時にコンパイルしてキャッシュ
+# 修正: write_key() でコメント行を誤って上書きしないよう、
+#       行頭コメント（#）を除外する正規表現を事前コンパイルする
+_KEY_PATTERNS: Dict[str, re.Pattern] = {}
+
+
+def _get_key_pattern(key: str) -> re.Pattern:
+    """キー名に対応する行マッチパターンを返す（キャッシュ付き）。"""
+    if key not in _KEY_PATTERNS:
+        # ^ の直後に # が来る行（コメント行）を除外するため
+        # (?!#) の否定先読みを使用して非コメント行のみにマッチさせる
+        _KEY_PATTERNS[key] = re.compile(
+            rf"^(?![ \t]*#){re.escape(key)}\s*="
+        )
+    return _KEY_PATTERNS[key]
 
 
 def load(env_path: Optional[str] = None) -> bool:
@@ -106,12 +123,10 @@ def get(key: str, default: Any = None) -> Any:
     raw = os.environ.get(key)
 
     if raw is None:
-        # 環境変数未設定 → スキーマのデフォルト値を使用
         if schema is not None:
             return schema["default"]
         return default
 
-    # 型変換
     if schema is not None:
         typ = schema["type"]
         try:
@@ -150,6 +165,9 @@ def write_key(key: str, value: Any) -> bool:
     .env ファイルの特定キーを更新する。
     GUI設定保存時に使用する。
 
+    修正: コメント行（# KEY=... 形式）を誤って上書きしないよう
+          (?![ \\t]*#) 否定先読みを使ってコメント行をスキップする。
+
     Args:
         key:   環境変数キー
         value: 設定する値
@@ -162,16 +180,18 @@ def write_key(key: str, value: Any) -> bool:
         return False
 
     try:
-        import re
         content = _env_path.read_text(encoding="utf-8")
         lines = content.splitlines()
         new_line = f"{key}={value}"
+        pattern = _get_key_pattern(key)
         found = False
+
         for i, line in enumerate(lines):
-            if re.match(rf"^{re.escape(key)}\s*=", line):
+            if pattern.match(line):
                 lines[i] = new_line
                 found = True
                 break
+
         if not found:
             lines.append(new_line)
 

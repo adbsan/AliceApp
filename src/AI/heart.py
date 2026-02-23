@@ -18,6 +18,12 @@ AI推論の心臓部（中層構造）。
   - 設定参照: ×
   - 推論:     ○
   - 永続化:   ×
+
+修正:
+  - _stream() の generate_content_stream 呼び出しを
+    コンテキストマネージャ形式と直接イテラブル形式の両方に対応させた。
+    google-genai のバージョンによって返却型が異なるため、
+    __enter__ の有無を確認してから適切な方法でストリームを読み取る。
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ class AliceHeart:
     AI推論の心臓部クラス。
 
     Usage:
-        heart = AliceHeart(client=gemini_client, model_name=model_name)  # model_name は neural_loader_module から渡される
+        heart = AliceHeart(client=gemini_client, model_name=model_name)
         result = heart.execute(payload)
     """
 
@@ -186,18 +192,41 @@ class AliceHeart:
         cfg: Any,
         on_chunk: Callable[[str], None],
     ) -> str:
-        """ストリーミング推論。"""
+        """
+        ストリーミング推論。
+
+        修正: google-genai のバージョンによって generate_content_stream() が
+              コンテキストマネージャ（with 文対応）を返す場合と、
+              直接イテラブルを返す場合がある。
+              __enter__ 属性の有無で判定し、両方のパターンに対応する。
+        """
         full = ""
-        with self._client.models.generate_content_stream(
+        response = self._client.models.generate_content_stream(
             model=self._model_name,
             contents=contents,
             config=cfg,
-        ) as stream:
-            for chunk in stream:
+        )
+
+        # コンテキストマネージャ形式か直接イテラブルかを判定
+        if hasattr(response, "__enter__"):
+            # コンテキストマネージャ形式（旧 API）
+            stream = response.__enter__()
+            try:
+                for chunk in stream:
+                    text = chunk.text or ""
+                    full += text
+                    if text:
+                        on_chunk(text)
+            finally:
+                response.__exit__(None, None, None)
+        else:
+            # 直接イテラブル形式（新 API）
+            for chunk in response:
                 text = chunk.text or ""
                 full += text
                 if text:
                     on_chunk(text)
+
         return full
 
     def _generate(self, contents: list, cfg: Any) -> str:

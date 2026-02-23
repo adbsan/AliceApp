@@ -10,6 +10,12 @@ result_log_module.py
 制約:
   - 推論を実行しない
   - 設定は env_binder_module 経由でのみ取得
+
+修正:
+  - _LOGS_DIR をカレントディレクトリ相対 Path("logs") から
+    このモジュールファイルを起点とした絶対パスに変更した。
+    これにより、AliceApp.py と異なるディレクトリから実行された場合でも
+    ログが意図しない場所に書かれるバグを防ぐ。
 """
 
 from __future__ import annotations
@@ -23,7 +29,11 @@ from loguru import logger
 # ============================================================
 # ファイルパス定数
 # ============================================================
-_LOGS_DIR = Path("logs")
+# 修正: Path("logs") → このファイルの親ディレクトリ（module/）の
+#       さらに親（プロジェクトルート）を基準にした絶対パスへ変更
+_MODULE_DIR = Path(__file__).parent.resolve()       # module/
+_PROJECT_ROOT = _MODULE_DIR.parent                  # AliceApp/
+_LOGS_DIR = _PROJECT_ROOT / "logs"
 _CHAT_HISTORY_FILE = _LOGS_DIR / "chat_history.json"
 _MAX_HISTORY_PERSIST = 200   # ファイルに保存する最大メッセージ数
 
@@ -65,7 +75,6 @@ def save_history(messages: list) -> bool:
     _ensure_logs_dir()
     try:
         data = [m.to_dict() if hasattr(m, "to_dict") else m for m in messages]
-        # 最大件数を超えた分を切り詰める
         if len(data) > _MAX_HISTORY_PERSIST:
             data = data[-_MAX_HISTORY_PERSIST:]
 
@@ -108,6 +117,11 @@ def clear_history() -> bool:
         return False
 
 
+def get_logs_dir() -> Path:
+    """ログディレクトリの絶対パスを返す（外部からの参照用）。"""
+    return _LOGS_DIR
+
+
 # ============================================================
 # 内部処理
 # ============================================================
@@ -124,7 +138,6 @@ def _append_to_history(entry: Dict[str, Any]) -> None:
             with open(_CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
                 existing = json.load(f)
         existing.append(entry)
-        # 最大件数を超えた分を切り詰める
         if len(existing) > _MAX_HISTORY_PERSIST:
             existing = existing[-_MAX_HISTORY_PERSIST:]
         with open(_CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:

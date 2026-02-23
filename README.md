@@ -24,8 +24,10 @@ assets/images/alice_idle.png      ... 待機ポーズ（任意）
 assets/images/alice_speaking.png  ... 話し中ポーズ（任意）
 assets/images/alice_thinking.png  ... 考え中ポーズ（任意）
 assets/images/alice_greeting.png  ... 挨拶ポーズ（任意）
-assets/parts/sheet.png            ... 4x4スプライトシート（任意）
 ```
+
+> **注意**: `assets/images/` に PNG ファイルを直接配置してください。  
+> 画像は `1:1` の正方形（推奨: 512×512 以上）、背景透過（RGBA）が最適です。
 
 ### 4. 起動
 ```bash
