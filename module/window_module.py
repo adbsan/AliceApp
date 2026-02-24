@@ -24,10 +24,23 @@ import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Dict, Optional
 
 from loguru import logger
+
+# 背景除去に使用するライブラリ（任意依存）
+try:
+    import numpy as np
+    import cv2
+    from scipy import ndimage
+    from collections import deque
+    _BG_REMOVAL_AVAILABLE = True
+except ImportError:
+    _BG_REMOVAL_AVAILABLE = False
+
+# プロジェクトルート（assets/images への絶対パス解決用）
+_WIN_ROOT = Path(__file__).parent.parent.resolve()
 
 from module.display_mode_module import (
     AppMode, CharacterState, LayoutConfig, Theme,
@@ -205,6 +218,399 @@ class CharacterAnimator:
                 )
         except Exception as e:
             logger.error(f"アニメーションレンダリングエラー: {e}")
+
+
+# ================================================================== #
+# 背景除去ダイアログ
+# ================================================================== #
+
+class BgRemovalDialog(tk.Toplevel):
+    """
+    画像の背景を自動除去してキャラクター画像として登録するダイアログ。
+
+    アルゴリズム:
+      1. 純白(255,255,255)のみ BFS で外側から除去
+      2. GrabCut で「キャラクター領域」を補完
+      3. BFS非背景 ∪ GrabCut前景 → 前景マスク
+      4. 小クラスタ(面積<100px)のノイズ除去
+      5. 穴埋め（内部の背景島を前景に）
+      6. ソフトエッジ（境界1.5pxをフェザリング）
+    """
+
+    _POSES = ["default", "idle", "speaking", "thinking", "greeting"]
+
+    def __init__(self, parent, char_loader=None, on_reload: Optional[Callable] = None):
+        super().__init__(parent)
+        self._char_loader  = char_loader
+        self._on_reload    = on_reload
+        self._src_image: Optional["Image.Image"] = None
+        self._result_image: Optional["Image.Image"] = None
+        self._tk_before: Optional["ImageTk.PhotoImage"] = None
+        self._tk_after:  Optional["ImageTk.PhotoImage"] = None
+        self._processing = False
+
+        theme_name = "dark"
+        try:
+            from module.display_mode_module import Theme
+            c = Theme.get(theme_name)
+        except Exception:
+            c = type("C", (), {
+                "bg_primary": "#1e1e2e", "bg_secondary": "#181825",
+                "bg_tertiary": "#313244", "text_primary": "#cdd6f4",
+                "text_secondary": "#a6adc8", "text_muted": "#585b70",
+                "accent_primary": "#89b4fa", "border": "#45475a",
+                "border_focus": "#89b4fa", "success": "#a6e3a1",
+                "error_color": "#f38ba8",
+            })()
+        self._c = c
+
+        self.title("背景除去ツール")
+        self.geometry("900x620")
+        self.minsize(760, 520)
+        self.configure(bg=c.bg_primary)
+        self.transient(parent)
+        self.grab_set()
+        self._build(c)
+
+        if not _BG_REMOVAL_AVAILABLE:
+            self._set_status("※ numpy / opencv-python / scipy が必要です。pip install numpy opencv-python scipy", error=True)
+
+    # ------------------------------------------------------------------ #
+    # UI構築
+    # ------------------------------------------------------------------ #
+
+    def _build(self, c):
+        # ── ツールバー行 ──────────────────────────────────────────────
+        tb = tk.Frame(self, bg=c.bg_secondary, pady=8)
+        tb.pack(fill="x", padx=0)
+
+        self._btn(tb, c, "📂  画像を選択", self._select_file, c.bg_tertiary, c.text_primary).pack(side="left", padx=12)
+
+        self._path_var = tk.StringVar(value="ファイルを選択してください")
+        tk.Label(tb, textvariable=self._path_var, bg=c.bg_secondary,
+                 fg=c.text_secondary, font=("Segoe UI", 9),
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=8)
+
+        # ── プレビューエリア ─────────────────────────────────────────
+        preview_frame = tk.Frame(self, bg=c.bg_primary)
+        preview_frame.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.columnconfigure(1, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+
+        for col, label in [(0, "元画像"), (1, "処理後（背景透過）")]:
+            tk.Label(preview_frame, text=label, bg=c.bg_primary,
+                     fg=c.text_secondary, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=col, sticky="w", padx=4, pady=(0, 2))
+
+        # 元画像キャンバス
+        self._canvas_before = tk.Canvas(
+            preview_frame, bg="#2a2a3a", highlightthickness=1,
+            highlightbackground=c.border)
+        self._canvas_before.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+
+        # 結果キャンバス（チェッカーパターン背景で透明度を視覚化）
+        self._canvas_after = tk.Canvas(
+            preview_frame, bg="#2a2a3a", highlightthickness=1,
+            highlightbackground=c.border)
+        self._canvas_after.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+        self._canvas_after.bind("<Configure>", lambda e: self._redraw_after())
+
+        # ── コントロール行 ───────────────────────────────────────────
+        ctrl = tk.Frame(self, bg=c.bg_secondary, pady=10)
+        ctrl.pack(fill="x", padx=0)
+
+        tk.Label(ctrl, text="保存先ポーズ:", bg=c.bg_secondary,
+                 fg=c.text_secondary, font=("Segoe UI", 10)).pack(side="left", padx=(14, 4))
+
+        self._pose_var = tk.StringVar(value="default")
+        pose_cb = ttk.Combobox(ctrl, textvariable=self._pose_var,
+                                values=self._POSES, state="readonly",
+                                width=12, font=("Segoe UI", 10))
+        pose_cb.pack(side="left", padx=(0, 16))
+
+        self._process_btn = self._btn(
+            ctrl, c, "✨  背景を除去", self._start_processing,
+            c.accent_primary, c.bg_primary)
+        self._process_btn.pack(side="left", padx=4)
+
+        self._save_btn = self._btn(
+            ctrl, c, "💾  保存してキャラクターに設定", self._save_and_apply,
+            "#a6e3a1", c.bg_primary)
+        self._save_btn.pack(side="left", padx=8)
+        self._save_btn.configure(state="disabled")
+
+        # プログレスバー
+        style = ttk.Style()
+        style.configure("BR.Horizontal.TProgressbar",
+                        troughcolor=c.bg_tertiary,
+                        background=c.accent_primary, thickness=4)
+        self._progress = ttk.Progressbar(
+            ctrl, style="BR.Horizontal.TProgressbar",
+            mode="indeterminate", length=120)
+        self._progress.pack(side="left", padx=8)
+
+        # ステータスラベル
+        self._status_var = tk.StringVar(value="画像を選択してください")
+        self._status_lbl = tk.Label(
+            ctrl, textvariable=self._status_var,
+            bg=c.bg_secondary, fg=c.text_muted,
+            font=("Segoe UI", 9), anchor="w")
+        self._status_lbl.pack(side="left", fill="x", expand=True, padx=8)
+
+        self._btn(ctrl, c, "閉じる", self.destroy,
+                  c.bg_tertiary, c.text_secondary).pack(side="right", padx=12)
+
+    # ------------------------------------------------------------------ #
+    # ファイル選択
+    # ------------------------------------------------------------------ #
+
+    def _select_file(self):
+        path = filedialog.askopenfilename(
+            title="背景除去する画像を選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp"), ("すべて", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            if not _PIL_AVAILABLE:
+                self._set_status("Pillow が必要です", error=True)
+                return
+            img = Image.open(path).convert("RGBA")
+            self._src_image = img
+            self._result_image = None
+            self._save_btn.configure(state="disabled")
+            self._path_var.set(Path(path).name)
+            self._draw_preview(self._canvas_before, img, checker=False)
+            self._clear_canvas(self._canvas_after)
+            self._set_status("画像を読み込みました。「背景を除去」を押してください。")
+        except Exception as e:
+            self._set_status(f"読み込みエラー: {e}", error=True)
+
+    # ------------------------------------------------------------------ #
+    # 背景除去処理
+    # ------------------------------------------------------------------ #
+
+    def _start_processing(self):
+        if not _BG_REMOVAL_AVAILABLE:
+            self._set_status("numpy / opencv-python / scipy が未インストールです", error=True)
+            return
+        if self._src_image is None:
+            self._set_status("先に画像を選択してください", error=True)
+            return
+        if self._processing:
+            return
+        self._processing = True
+        self._process_btn.configure(state="disabled")
+        self._save_btn.configure(state="disabled")
+        self._progress.start(12)
+        self._set_status("処理中...")
+        threading.Thread(target=self._run_removal, daemon=True).start()
+
+    def _run_removal(self):
+        """バックグラウンドスレッドで背景除去を実行する。"""
+        try:
+            result = _remove_background(self._src_image)
+            self.after(0, self._on_done, result)
+        except Exception as e:
+            self.after(0, self._on_error, str(e))
+
+    def _on_done(self, result: "Image.Image"):
+        self._result_image = result
+        self._progress.stop()
+        self._processing = False
+        self._process_btn.configure(state="normal")
+        self._save_btn.configure(state="normal")
+        self._set_status("完了！保存先ポーズを選んで「保存」を押してください。")
+        self._draw_preview(self._canvas_after, result, checker=True)
+
+    def _on_error(self, msg: str):
+        self._progress.stop()
+        self._processing = False
+        self._process_btn.configure(state="normal")
+        self._set_status(f"エラー: {msg}", error=True)
+
+    # ------------------------------------------------------------------ #
+    # 保存 & キャラクター反映
+    # ------------------------------------------------------------------ #
+
+    def _save_and_apply(self):
+        if self._result_image is None:
+            return
+        pose = self._pose_var.get()
+        pose_map = {
+            "default":  "alice_default",
+            "idle":     "alice_idle",
+            "speaking": "alice_speaking",
+            "thinking": "alice_thinking",
+            "greeting": "alice_greeting",
+        }
+        fname = pose_map.get(pose, "alice_default")
+        dest_dir = _WIN_ROOT / "assets" / "images"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{fname}.png"
+        try:
+            self._result_image.save(dest, "PNG")
+            logger.info(f"BgRemovalDialog: 保存 → {dest}")
+            self._set_status(f"保存しました: assets/images/{fname}.png")
+            # CharacterLoader のキャッシュをクリアして再読み込み
+            if self._char_loader is not None:
+                self._char_loader.reload()
+            if self._on_reload is not None:
+                self.after(200, self._on_reload)
+            messagebox.showinfo(
+                "保存完了",
+                f"キャラクター画像を保存しました。\n"
+                f"ポーズ: {pose}\n"
+                f"パス: assets/images/{fname}.png",
+                parent=self
+            )
+        except Exception as e:
+            self._set_status(f"保存エラー: {e}", error=True)
+            messagebox.showerror("保存エラー", str(e), parent=self)
+
+    # ------------------------------------------------------------------ #
+    # プレビュー描画
+    # ------------------------------------------------------------------ #
+
+    def _draw_preview(self, canvas: tk.Canvas, img: "Image.Image", checker: bool):
+        """キャンバスにフィットさせて画像を描画する。"""
+        if not _PIL_AVAILABLE:
+            return
+        canvas.update_idletasks()
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            cw, ch = 380, 460
+        ratio = min(cw / img.width, ch / img.height) * 0.95
+        nw, nh = max(1, int(img.width * ratio)), max(1, int(img.height * ratio))
+        x, y = (cw - nw) // 2, (ch - nh) // 2
+
+        if checker and img.mode == "RGBA":
+            # チェッカーパターン背景に合成して透明度を可視化
+            bg = _make_checker(nw, nh)
+            resized = img.resize((nw, nh), Image.LANCZOS)
+            bg.paste(resized, (0, 0), resized)
+            display = bg
+        else:
+            display = img.resize((nw, nh), Image.LANCZOS)
+
+        tk_img = ImageTk.PhotoImage(display)
+        canvas.delete("all")
+        canvas.create_image(x, y, anchor="nw", image=tk_img)
+        # PhotoImage を保持（GC対策）
+        if canvas is self._canvas_before:
+            self._tk_before = tk_img
+        else:
+            self._tk_after = tk_img
+
+    def _redraw_after(self):
+        if self._result_image is not None:
+            self._draw_preview(self._canvas_after, self._result_image, checker=True)
+
+    def _clear_canvas(self, canvas: tk.Canvas):
+        canvas.delete("all")
+
+    # ------------------------------------------------------------------ #
+    # ユーティリティ
+    # ------------------------------------------------------------------ #
+
+    def _set_status(self, msg: str, error: bool = False):
+        self._status_var.set(msg)
+        self._status_lbl.configure(
+            fg=self._c.error_color if error else self._c.text_muted)
+
+    def _btn(self, parent, c, text: str, cmd, bg: str, fg: str) -> tk.Button:
+        return tk.Button(
+            parent, text=text, command=cmd, bg=bg, fg=fg,
+            font=("Segoe UI", 10), relief="flat", padx=12, pady=5,
+            activebackground=c.bg_tertiary, activeforeground=c.text_primary,
+            cursor="hand2",
+        )
+
+
+# ================================================================== #
+# 背景除去アルゴリズム（スタンドアロン関数）
+# ================================================================== #
+
+def _remove_background(src_img: "Image.Image") -> "Image.Image":
+    """
+    白背景画像からキャラクターだけを切り抜いて RGBA で返す。
+
+    アルゴリズム:
+      1. 純白(255,255,255) BFS で外周から除去
+      2. GrabCut で「キャラクター領域」を補完
+      3. BFS非背景 ∪ GrabCut前景 → 前景マスク
+      4. 小クラスタ(< 100px)のノイズ除去
+      5. 穴埋め
+      6. 1.5px フェザリングでソフトエッジ
+    """
+    arr = np.array(src_img.convert("RGBA"))
+    h, w = arr.shape[:2]
+
+    # Step1: 純白 BFS ─────────────────────────────────────────────────
+    rgb = arr[:, :, :3].astype(np.int32)
+    is_pure_white = (rgb[:,:,0]==255) & (rgb[:,:,1]==255) & (rgb[:,:,2]==255)
+
+    visited = np.zeros((h, w), dtype=bool)
+    q = deque()
+    def _seed(r, c):
+        if not visited[r,c] and is_pure_white[r,c]:
+            visited[r,c] = True; q.append((r,c))
+    for r in range(h): _seed(r,0); _seed(r,w-1)
+    for c in range(w): _seed(0,c); _seed(h-1,c)
+    nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    while q:
+        r, c = q.popleft()
+        for dr, dc in nb8:
+            nr, nc = r+dr, c+dc
+            if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and is_pure_white[nr,nc]:
+                visited[nr,nc] = True; q.append((nr,nc))
+    bfs_bg = visited
+
+    # Step2: GrabCut ───────────────────────────────────────────────────
+    bgr = cv2.cvtColor(arr[:,:,:3], cv2.COLOR_RGB2BGR)
+    rect = (8, 8, w-16, h-16)
+    mask_gc = np.zeros((h,w), np.uint8)
+    bgd = np.zeros((1,65), np.float64); fgd = np.zeros((1,65), np.float64)
+    cv2.grabCut(bgr, mask_gc, rect, bgd, fgd, 15, cv2.GC_INIT_WITH_RECT)
+    gc_fg = (mask_gc==cv2.GC_FGD) | (mask_gc==cv2.GC_PR_FGD)
+
+    # Step3: 組み合わせ前景 ────────────────────────────────────────────
+    fg = (~bfs_bg) | gc_fg
+
+    # Step4: 小クラスタ除去 ────────────────────────────────────────────
+    labeled, num = ndimage.label(fg.astype(np.uint8))
+    sizes = ndimage.sum(fg, labeled, range(1, num+1))
+    for i, s in enumerate(sizes):
+        if s < 100:
+            fg[labeled == (i+1)] = False
+
+    # Step5: 穴埋め ────────────────────────────────────────────────────
+    fg = ndimage.binary_fill_holes(fg)
+
+    # Step6: フェザリング ──────────────────────────────────────────────
+    dist_in  = ndimage.distance_transform_edt(fg).astype(np.float32)
+    dist_out = ndimage.distance_transform_edt(~fg).astype(np.float32)
+    FEATHER = 1.5
+    alpha_f = np.clip(dist_in / FEATHER, 0.0, 1.0)
+    alpha_f[fg & (dist_out > FEATHER*2)] = 1.0
+    alpha = (alpha_f * 255).astype(np.uint8)
+
+    result = arr.copy()
+    result[:,:,3] = alpha
+    return Image.fromarray(result)
+
+
+def _make_checker(w: int, h: int, size: int = 12) -> "Image.Image":
+    """チェッカーパターン背景画像を生成する（透明度の視覚化用）。"""
+    bg = Image.new("RGBA", (w, h), (255,255,255,255))
+    dark = (200, 200, 200, 255)
+    px = bg.load()
+    for y in range(h):
+        for x in range(w):
+            if ((x // size) + (y // size)) % 2 == 1:
+                px[x, y] = dark
+    return bg
 
 
 # ================================================================== #
@@ -571,6 +977,8 @@ class AliceMainWindow:
         # ツール
         tm = menu(menubar)
         tm.add_command(label="キャラクター再読み込み", command=self._reload_character)
+        tm.add_command(label="背景除去ツール",         command=self._open_bg_removal)
+        tm.add_separator()
         tm.add_command(label="VOICEVOX 接続確認",     command=self._check_voicevox)
         tm.add_separator()
         tm.add_command(label="ログフォルダを開く",    command=self._open_logs)
@@ -903,6 +1311,15 @@ class AliceMainWindow:
         self._char_loader.reload()
         self._load_character()
         self._update_status("キャラクターを再読み込みしました。")
+
+    def _open_bg_removal(self):
+        """背景除去ダイアログを開く。"""
+        dlg = BgRemovalDialog(
+            self.root,
+            char_loader=self._char_loader,
+            on_reload=self._reload_character,
+        )
+        self.root.wait_window(dlg)
 
     def _check_voicevox(self):
         if self._voice:
