@@ -13,6 +13,12 @@ Alice AI メインGUIウィンドウ。
 制約:
   - 推論を実行しない（AliceEngine に委譲）
   - 設定参照は env_binder_module 経由のみ
+
+修正（v2）:
+  - AdvancedBgRemovalDialog._build_ui() 冒頭で _coord_var / _tool_info_var を
+    先に初期化するよう変更。_build_toolbar() → _select_tool() の呼び出し時点で
+    これらの変数が未作成だったために発生する AttributeError を修正。
+  - _build_status_bar() 内の重複 StringVar 作成を削除。
 """
 
 from __future__ import annotations
@@ -237,25 +243,44 @@ class CharacterAnimator:
 # 高度な画像処理エンジン（独自アルゴリズム・API不使用）
 # ================================================================== #
 
+
+# ================================================================== #
+# 高度な画像処理エンジン v3
+# 学習済みモデル不使用・純粋アルゴリズム実装
+#
+# 実装機能:
+#   1. 高精度エッジ検出（Sobel/Laplacian/Canny近似 融合・ベクトル化）
+#   2. 適応的背景除去（Lab色空間 + GMM近似 + IterativeGrabCut）
+#   3. Alpha Matting（トライマップ生成 + KNN近似マッティング）
+#   4. SEGS：K-means色クラスタリング + ConnectedComponents
+#   5. 部位検出（顔・肌・髪・服）YCbCr/HSV + 形状解析
+#   6. 各種選択範囲除去・ブラシ編集
+#   7. 背景合成
+# ================================================================== #
+
 class AdvancedImageProcessor:
     """
     独自アルゴリズムによる高精度画像処理エンジン。
-    外部API・学習済みモデル不使用。すべてアルゴリズムで実装。
+    外部API・学習済みモデル不使用。コード自体が学習済みモデル。
 
-    機能:
-      1. 高精度エッジ検出（Canny + Laplacian + Sobel の融合）
-      2. 適応的背景除去（Lab色空間 + グラフカット近似 + BFS）
-      3. 精細マスク精錬（形態学的処理 + ガウシアンフェザリング）
-      4. ポイント処理（ユーザー指定ピクセルからの範囲除去）
-      5. 選択範囲処理（矩形・楕円・自由曲線領域の除去）
-      6. 新背景合成（チェッカー・単色・グラデーション・画像）
+    コア技術:
+      - CIELab色空間での知覚的距離計算
+      - Gaussian Mixture Model (GMM) 近似によるFG/BG分類
+      - Iterative GrabCut近似（エネルギー最小化）
+      - KNN Alpha Matting（境界部の毛髪・半透明表現）
+      - YCbCr/HSV複合肌色モデルによる部位検出
+      - 形態学的解析による顔・髪・服の分離
+      - K-means色クラスタリング（SEGS）
     """
 
-    # ----- 定数 -----
-    _FEATHER_RADIUS   = 2.5    # エッジのフェザリング半径(px)
-    _HAIR_DETAIL_ITER = 3      # 髪の毛詳細処理イテレーション数
-    _MIN_CLUSTER_PX   = 50     # 小クラスタ除去しきい値
-    _EDGE_BLEND_ALPHA = 0.35   # エッジ検出融合比率
+    # ---------- 調整定数 ----------
+    _FEATHER_RADIUS   = 3.0
+    _MIN_CLUSTER_PX   = 80
+    _GRABCUT_ITER     = 4          # GrabCut近似イテレーション数
+    _KMEANS_CLUSTERS  = 6          # SEGSクラスタ数
+    _KMEANS_ITER      = 10         # K-meansイテレーション数
+    _MATTING_K        = 10         # KNN Matte探索近傍数
+    _MATTING_WIN      = 3          # Matte走査ウィンドウ半径
 
     def __init__(self) -> None:
         self._available = _NUMPY_AVAILABLE and _PIL_AVAILABLE
@@ -264,108 +289,116 @@ class AdvancedImageProcessor:
         return self._available
 
     # ================================================================
-    # ① 高精度エッジ検出（Sobel + Laplacian + 適応的閾値）
+    # ① 高精度エッジ検出（完全ベクトル化）
     # ================================================================
 
     def detect_edges_highquality(self, img_rgba: "np.ndarray") -> "np.ndarray":
         """
-        複数のエッジ検出手法を融合した高精度エッジマップを返す。
-        髪の毛・細かいディテールも検出できるよう設計。
-
-        Returns:
-            uint8 グレースケール配列 (0=背景, 255=エッジ)
+        Sobel + Laplacian + Canny近似を融合した高精度エッジマップ。
+        ループなし完全ベクトル化で高速動作。
         """
         if not _NUMPY_AVAILABLE:
             return np.zeros(img_rgba.shape[:2], dtype=np.uint8)
 
         gray = self._to_gray(img_rgba)
 
-        # Sobelフィルタ（x, y方向の勾配を合成）
-        sobel_x = self._sobel_x(gray)
-        sobel_y = self._sobel_y(gray)
-        sobel   = np.sqrt(sobel_x**2 + sobel_y**2)
-        sobel   = np.clip(sobel / sobel.max() * 255, 0, 255).astype(np.uint8) if sobel.max() > 0 else sobel.astype(np.uint8)
+        # Sobelエッジ（ベクトル化）
+        sx = self._convolve2d_fast(gray, np.array([[-1,0,1],[-2,0,2],[-1,0,1]], np.float32))
+        sy = self._convolve2d_fast(gray, np.array([[-1,-2,-1],[0,0,0],[1,2,1]], np.float32))
+        sobel = np.sqrt(sx**2 + sy**2)
+        m = sobel.max()
+        if m > 0: sobel = sobel / m * 255
 
-        # Laplacianフィルタ（二次微分：細かい輪郭強調）
-        lap = self._laplacian(gray)
-        lap = np.abs(lap)
-        lap = np.clip(lap / lap.max() * 255, 0, 255).astype(np.uint8) if lap.max() > 0 else lap.astype(np.uint8)
+        # Laplacianエッジ
+        lap = np.abs(self._convolve2d_fast(gray, np.array([[0,1,0],[1,-4,1],[0,1,0]], np.float32)))
+        m = lap.max()
+        if m > 0: lap = lap / m * 255
 
-        # 適応的しきい値によるCannyライク処理
-        canny_like = self._adaptive_threshold_edge(gray)
+        # Canny近似（Non-Maximum Suppression + 二重しきい値）
+        canny = self._canny_approx(gray, sobel, sx, sy)
 
-        # 3種のエッジマップを加重融合
-        fused = (
-            sobel.astype(np.float32)     * 0.40 +
-            lap.astype(np.float32)       * 0.25 +
-            canny_like.astype(np.float32)* 0.35
-        )
-        fused = np.clip(fused, 0, 255).astype(np.uint8)
+        # 加重融合
+        fused = np.clip(sobel * 0.40 + lap * 0.25 + canny * 0.35, 0, 255).astype(np.uint8)
 
-        # 髪の毛などの細線強調（細線化ノイズ除去）
-        fused = self._enhance_thin_lines(fused)
+        # モルフォロジーによる細線強調
+        if _SCIPY_AVAILABLE:
+            s2 = np.ones((2, 2), bool)
+            dilated = ndimage.binary_dilation(fused > 60, structure=s2)
+            eroded  = ndimage.binary_erosion(dilated, structure=s2)
+            fused   = np.maximum(fused, (eroded * 220).astype(np.uint8))
 
         return fused
 
+    def _canny_approx(self, gray, grad_mag, gx, gy):
+        """Non-Maximum Suppression + 二重しきい値のCanny近似（ベクトル化）"""
+        h, w = gray.shape
+        angle = np.arctan2(gy, gx + 1e-9) * 180 / np.pi
+        angle[angle < 0] += 180
+
+        # 非最大値抑制（ベクトル化近似）
+        nms = grad_mag.copy()
+        padded = np.pad(grad_mag, 1, mode='edge')
+
+        # 0°方向
+        m0 = (angle < 22.5) | (angle >= 157.5)
+        nms[m0] = np.where(
+            (grad_mag[m0] >= padded[1:-1, 2:][m0]) & (grad_mag[m0] >= padded[1:-1, :-2][m0]),
+            grad_mag[m0], 0)
+
+        # 45°方向
+        m45 = (angle >= 22.5) & (angle < 67.5)
+        nms[m45] = np.where(
+            (grad_mag[m45] >= padded[:-2, 2:][m45]) & (grad_mag[m45] >= padded[2:, :-2][m45]),
+            grad_mag[m45], 0)
+
+        # 90°方向
+        m90 = (angle >= 67.5) & (angle < 112.5)
+        nms[m90] = np.where(
+            (grad_mag[m90] >= padded[:-2, 1:-1][m90]) & (grad_mag[m90] >= padded[2:, 1:-1][m90]),
+            grad_mag[m90], 0)
+
+        # 135°方向
+        m135 = (angle >= 112.5) & (angle < 157.5)
+        nms[m135] = np.where(
+            (grad_mag[m135] >= padded[:-2, :-2][m135]) & (grad_mag[m135] >= padded[2:, 2:][m135]),
+            grad_mag[m135], 0)
+
+        # 二重しきい値
+        high = nms.max() * 0.20
+        low  = high * 0.40
+        strong  = nms >= high
+        weak    = (nms >= low) & ~strong
+        # 連結する（強エッジに隣接する弱エッジを採用）
+        if _SCIPY_AVAILABLE:
+            strong_d = ndimage.binary_dilation(strong, np.ones((3,3), bool))
+            result   = (strong | (weak & strong_d)).astype(np.float32) * 255
+        else:
+            result = strong.astype(np.float32) * 255
+
+        return result
+
+    def _convolve2d_fast(self, img: "np.ndarray", kernel: "np.ndarray") -> "np.ndarray":
+        """完全ベクトル化畳み込み（scipy/cv2 非依存）"""
+        kh, kw = kernel.shape
+        ph, pw = kh // 2, kw // 2
+        padded = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
+        h, w = img.shape
+        # unfold trick で高速化
+        cols = np.lib.stride_tricks.as_strided(
+            padded,
+            shape=(h, w, kh, kw),
+            strides=(padded.strides[0], padded.strides[1], padded.strides[0], padded.strides[1]),
+        )
+        return (cols * kernel[np.newaxis, np.newaxis, :, :]).sum(axis=(2, 3))
+
     def _to_gray(self, arr: "np.ndarray") -> "np.ndarray":
-        """RGBA → グレースケール（知覚的重みづけ）"""
         r = arr[:, :, 0].astype(np.float32)
         g = arr[:, :, 1].astype(np.float32)
         b = arr[:, :, 2].astype(np.float32)
-        return (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
-
-    def _sobel_x(self, gray: "np.ndarray") -> "np.ndarray":
-        kernel = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
-        return self._convolve2d(gray, kernel)
-
-    def _sobel_y(self, gray: "np.ndarray") -> "np.ndarray":
-        kernel = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
-        return self._convolve2d(gray, kernel)
-
-    def _laplacian(self, gray: "np.ndarray") -> "np.ndarray":
-        kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
-        return self._convolve2d(gray, kernel)
-
-    def _convolve2d(self, img: "np.ndarray", kernel: "np.ndarray") -> "np.ndarray":
-        """手動畳み込み（scipy/cv2 非依存の純粋numpy実装）"""
-        kh, kw = kernel.shape
-        ph, pw = kh // 2, kw // 2
-        h, w = img.shape
-        padded = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
-        result = np.zeros_like(img)
-        for i in range(kh):
-            for j in range(kw):
-                result += kernel[i, j] * padded[i:i+h, j:j+w]
-        return result
-
-    def _adaptive_threshold_edge(self, gray: "np.ndarray") -> "np.ndarray":
-        """局所適応的しきい値によるエッジ検出"""
-        h, w = gray.shape
-        block = 15
-        result = np.zeros((h, w), dtype=np.uint8)
-        ph, pw = block // 2, block // 2
-        padded = np.pad(gray, ((ph, ph), (pw, pw)), mode='edge')
-        for y in range(h):
-            for x in range(w):
-                local = padded[y:y+block, x:x+block]
-                mean  = local.mean()
-                std   = local.std()
-                thr   = mean - 0.5 * std
-                result[y, x] = 255 if gray[y, x] < thr else 0
-        return result
-
-    def _enhance_thin_lines(self, edge_map: "np.ndarray") -> "np.ndarray":
-        """細線（髪の毛など）の強調処理"""
-        if not _SCIPY_AVAILABLE:
-            return edge_map
-        # 細いエッジを膨張させてから元に戻す（ノイズ除去しつつ細線保持）
-        struct = np.ones((2, 2), dtype=bool)
-        dilated  = ndimage.binary_dilation(edge_map > 128, structure=struct).astype(np.uint8) * 255
-        eroded   = ndimage.binary_erosion(dilated > 128,  structure=struct).astype(np.uint8) * 255
-        return np.maximum(edge_map, eroded)
+        return 0.299 * r + 0.587 * g + 0.114 * b
 
     # ================================================================
-    # ② 適応的背景除去
+    # ② 高品質背景除去（GrabCut近似 + Alpha Matting）
     # ================================================================
 
     def remove_background_adaptive(
@@ -374,15 +407,7 @@ class AdvancedImageProcessor:
         sensitivity: float = 1.0,
     ) -> "np.ndarray":
         """
-        Lab色空間 + 適応的クラスタリング + BFS によって背景を除去する。
-        人物・動物・製品・車・グラフィックスなど多様な被写体に対応。
-
-        Args:
-            img_rgba:    RGBA numpy配列
-            sensitivity: 除去感度 (0.5=少なく, 1.0=標準, 2.0=多く)
-
-        Returns:
-            背景が透明になった RGBA numpy配列
+        Lab色空間 + Iterative GrabCut近似 + Alpha Mattingによる高品質背景除去。
         """
         if not _NUMPY_AVAILABLE:
             return img_rgba
@@ -390,123 +415,532 @@ class AdvancedImageProcessor:
         h, w = img_rgba.shape[:2]
         result = img_rgba.copy()
 
-        # Lab色空間に変換（人間の知覚に近い色差計算のため）
+        # Step1: Lab色空間変換
         lab = self._rgb_to_lab(img_rgba[:, :, :3])
 
-        # 四隅から背景色サンプリング
-        m = max(3, min(12, h // 10, w // 10))
-        corner_pixels = np.concatenate([
-            lab[:m, :m].reshape(-1, 3),
-            lab[:m, -m:].reshape(-1, 3),
-            lab[-m:, :m].reshape(-1, 3),
-            lab[-m:, -m:].reshape(-1, 3),
+        # Step2: 外周からBG色分布をサンプリング（GMM近似）
+        m = max(3, min(15, h // 8, w // 8))
+        bg_samples = np.concatenate([
+            lab[:m, :].reshape(-1, 3),
+            lab[-m:, :].reshape(-1, 3),
+            lab[:, :m].reshape(-1, 3),
+            lab[:, -m:].reshape(-1, 3),
         ])
-        bg_lab = corner_pixels.mean(axis=0)
-        bg_std = corner_pixels.std(axis=0).mean()
 
-        # Lab色差によるマスク生成
-        diff = np.sqrt(np.sum((lab - bg_lab) ** 2, axis=2))
-        base_threshold = max(8.0, bg_std * 2.5) * sensitivity
-        is_bg_raw = diff < base_threshold
+        # BG統計（平均・共分散）
+        bg_mean = bg_samples.mean(axis=0)
+        bg_cov  = np.cov(bg_samples.T) + np.eye(3) * 1e-6
+        bg_cov_inv = np.linalg.inv(bg_cov)
 
-        # BFSで外周から連結背景領域を特定
-        bg_mask = self._bfs_flood_fill(is_bg_raw, h, w)
+        # FGサンプル（中央付近）
+        cy, cx = h // 2, w // 2
+        cr = max(5, min(h, w) // 6)
+        fg_region = lab[cy-cr:cy+cr, cx-cr:cx+cr].reshape(-1, 3)
+        fg_mean = fg_region.mean(axis=0)
+        fg_cov  = np.cov(fg_region.T) + np.eye(3) * 1e-6
+        fg_cov_inv = np.linalg.inv(fg_cov)
 
-        # 半透明領域（エッジ付近）の精細処理
-        alpha_mask = self._refine_mask_with_edges(bg_mask, img_rgba, h, w)
+        # Step3: Mahalanobis距離でFG/BG確率マップ生成
+        flat = lab.reshape(-1, 3)
+        diff_bg = flat - bg_mean
+        diff_fg = flat - fg_mean
+        d_bg = np.einsum('ij,jk,ik->i', diff_bg, bg_cov_inv, diff_bg).reshape(h, w)
+        d_fg = np.einsum('ij,jk,ik->i', diff_fg, fg_cov_inv, diff_fg).reshape(h, w)
 
-        result[:, :, 3] = np.where(bg_mask, 0, alpha_mask)
+        # 感度スケール適用
+        base_th = max(6.0, np.sqrt(d_bg[m:-m, m:-m].mean() + 1e-6)) * sensitivity
+        is_bg_raw = d_bg < d_fg * 0.85
+
+        # Step4: Iterative GrabCut近似
+        bg_mask = self._grabcut_approx(is_bg_raw, lab, h, w, iterations=self._GRABCUT_ITER)
+
+        # Step5: Alpha Matting（境界部の半透明処理）
+        alpha = self._alpha_matte_knn(img_rgba, bg_mask, h, w)
+
+        result[:, :, 3] = alpha
         return result
 
-    def _rgb_to_lab(self, rgb: "np.ndarray") -> "np.ndarray":
-        """RGB → CIELab 変換（近似実装）"""
-        rgb_f = rgb.astype(np.float32) / 255.0
-
-        # sRGB → Linear RGB（ガンマ補正除去）
-        mask = rgb_f > 0.04045
-        linear = np.where(mask, ((rgb_f + 0.055) / 1.055) ** 2.4, rgb_f / 12.92)
-
-        # Linear RGB → XYZ (D65白色点)
-        r, g, b = linear[:, :, 0], linear[:, :, 1], linear[:, :, 2]
-        x = r * 0.4124 + g * 0.3576 + b * 0.1805
-        y = r * 0.2126 + g * 0.7152 + b * 0.0722
-        z = r * 0.0193 + g * 0.1192 + b * 0.9505
-
-        # XYZ → Lab
-        xn, yn, zn = 0.9505, 1.0000, 1.0890
-        fx = self._lab_f(x / xn)
-        fy = self._lab_f(y / yn)
-        fz = self._lab_f(z / zn)
-
-        L = 116 * fy - 16
-        a = 500 * (fx - fy)
-        b_c = 200 * (fy - fz)
-        return np.stack([L, a, b_c], axis=2)
-
-    def _lab_f(self, t: "np.ndarray") -> "np.ndarray":
-        delta = 6 / 29
-        return np.where(t > delta**3, t ** (1/3), t / (3 * delta**2) + 4/29)
-
-    def _bfs_flood_fill(self, is_bg: "np.ndarray", h: int, w: int) -> "np.ndarray":
-        """外周から連結背景領域をBFS探索"""
-        visited = np.zeros((h, w), dtype=bool)
-        q = deque()
-
-        def seed(r, c):
-            if not visited[r, c] and is_bg[r, c]:
-                visited[r, c] = True
-                q.append((r, c))
-
-        for r in range(h):
-            seed(r, 0); seed(r, w - 1)
-        for c in range(w):
-            seed(0, c); seed(h - 1, c)
-
-        nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-        while q:
-            r, c = q.popleft()
-            for dr, dc in nb8:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and is_bg[nr, nc]:
-                    visited[nr, nc] = True
-                    q.append((nr, nc))
-        return visited
-
-    def _refine_mask_with_edges(
+    def _grabcut_approx(
         self,
-        bg_mask: "np.ndarray",
+        init_bg: "np.ndarray",
+        lab: "np.ndarray",
+        h: int, w: int,
+        iterations: int = 4,
+    ) -> "np.ndarray":
+        """
+        Iterative GrabCut近似。
+        BGモデルとFGモデルを交互に更新してマスクを洗練する。
+        """
+        bg_mask = init_bg.copy()
+
+        for _ in range(iterations):
+            # BGサンプル再取得
+            bg_pix = lab[bg_mask].reshape(-1, 3)
+            fg_pix = lab[~bg_mask].reshape(-1, 3)
+            if len(bg_pix) < 10 or len(fg_pix) < 10:
+                break
+
+            bg_mean = bg_pix.mean(axis=0)
+            fg_mean = fg_pix.mean(axis=0)
+            bg_cov_inv = np.linalg.inv(np.cov(bg_pix.T) + np.eye(3) * 1e-4)
+            fg_cov_inv = np.linalg.inv(np.cov(fg_pix.T) + np.eye(3) * 1e-4)
+
+            flat = lab.reshape(-1, 3)
+            db = np.einsum('ij,jk,ik->i', flat - bg_mean, bg_cov_inv, flat - bg_mean)
+            df = np.einsum('ij,jk,ik->i', flat - fg_mean, fg_cov_inv, flat - fg_mean)
+            new_bg = (db < df).reshape(h, w)
+
+            # 外周は必ずBG
+            new_bg[:3, :]  = True
+            new_bg[-3:, :] = True
+            new_bg[:, :3]  = True
+            new_bg[:, -3:] = True
+
+            # BFS で外周連結BG領域のみ採用（孤立BGを除去）
+            new_bg = self._bfs_flood_fill(new_bg, h, w)
+
+            # モルフォロジー整形
+            if _SCIPY_AVAILABLE:
+                new_bg = ndimage.binary_closing(new_bg, np.ones((5, 5), bool))
+                new_bg = ndimage.binary_opening(new_bg, np.ones((3, 3), bool))
+
+            bg_mask = new_bg
+
+        return bg_mask
+
+    def _alpha_matte_knn(
+        self,
         img_rgba: "np.ndarray",
+        bg_mask: "np.ndarray",
         h: int, w: int,
     ) -> "np.ndarray":
-        """エッジ情報を使ってマスクの境界を精細化し、フェザリング処理を施す"""
+        """
+        KNN Alpha Matting。
+        境界付近のピクセルを周囲のFG/BGサンプルから補間して
+        滑らかなアルファ値を生成（髪・毛先・半透明対応）。
+        """
         fg_mask = ~bg_mask
 
+        if not _SCIPY_AVAILABLE:
+            return (fg_mask.astype(np.float32) * 255).astype(np.uint8)
+
+        # 距離変換でトライマップ生成
+        dist_to_fg = ndimage.distance_transform_edt(bg_mask)
+        dist_to_bg = ndimage.distance_transform_edt(fg_mask)
+
+        feather = max(3, min(h, w) // 40)
+        # トライマップ: 0=確実BG, 1=確実FG, 0.5=不明
+        alpha = np.where(bg_mask & (dist_to_fg > feather), 0.0,
+                np.where(fg_mask & (dist_to_bg > feather), 1.0, -1.0))
+
+        unknown = alpha < 0
+        if not unknown.any():
+            return (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+
+        # 不明領域: Lab色空間でFG/BGサンプルからKNN補間
+        lab = self._rgb_to_lab(img_rgba[:, :, :3])
+        unk_ys, unk_xs = np.where(unknown)
+
+        # FG/BGの確実サンプルを縮小取得（速度のため最大2000点）
+        sure_fg = np.where(alpha == 1.0)
+        sure_bg = np.where(alpha == 0.0)
+
+        def _subsample(ys, xs, maxn=2000):
+            if len(ys) > maxn:
+                idx = np.random.choice(len(ys), maxn, replace=False)
+                return ys[idx], xs[idx]
+            return ys, xs
+
+        fg_ys, fg_xs = _subsample(*sure_fg)
+        bg_ys, bg_xs = _subsample(*sure_bg)
+
+        if len(fg_ys) == 0 or len(bg_ys) == 0:
+            alpha[unknown] = 0.5
+            return (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+
+        fg_lab = lab[fg_ys, fg_xs]  # (N, 3)
+        bg_lab = lab[bg_ys, bg_xs]  # (M, 3)
+
+        # 不明ピクセルのLabをバッチ処理
+        unk_lab = lab[unk_ys, unk_xs]  # (K, 3)
+
+        # FGへの最近傍距離（L2）
+        K = self._MATTING_K
+        chunk = 500
+        alpha_vals = np.zeros(len(unk_ys), dtype=np.float32)
+
+        for start in range(0, len(unk_ys), chunk):
+            q = unk_lab[start:start+chunk]  # (chunk, 3)
+            df = np.sqrt(((q[:, np.newaxis, :] - fg_lab[np.newaxis, :, :]) ** 2).sum(axis=2))  # (chunk, N)
+            db = np.sqrt(((q[:, np.newaxis, :] - bg_lab[np.newaxis, :, :]) ** 2).sum(axis=2))  # (chunk, M)
+
+            # K最近傍の平均距離
+            df_k = np.sort(df, axis=1)[:, :K].mean(axis=1)
+            db_k = np.sort(db, axis=1)[:, :K].mean(axis=1)
+
+            # FGらしさ = BG距離 / (FG距離 + BG距離)
+            denom = df_k + db_k + 1e-6
+            alpha_vals[start:start+chunk] = db_k / denom
+
+        alpha[unk_ys, unk_xs] = alpha_vals
+        alpha = np.clip(alpha, 0, 1)
+
+        # ガウシアンスムージング（境界を滑らかに）
         if _SCIPY_AVAILABLE:
-            # 距離変換でフェザリング
-            dist_in  = ndimage.distance_transform_edt(fg_mask).astype(np.float32)
-            dist_out = ndimage.distance_transform_edt(bg_mask).astype(np.float32)
-            feather  = self._FEATHER_RADIUS
-            alpha    = np.clip(dist_in / feather, 0.0, 1.0)
-            alpha[fg_mask & (dist_out > feather * 3)] = 1.0
+            alpha = ndimage.gaussian_filter(alpha, sigma=1.0)
+            alpha = np.clip(alpha, 0, 1)
 
-            # 小クラスタ（ノイズ）除去
-            labeled, num = ndimage.label(fg_mask.astype(np.uint8))
-            if num > 0:
-                sizes = ndimage.sum(fg_mask, labeled, range(1, num + 1))
-                for i, s in enumerate(sizes):
-                    if s < self._MIN_CLUSTER_PX:
-                        alpha[labeled == (i + 1)] = 0
-
-            # 穴埋め（被写体内部の孤立した背景ピクセル）
-            filled = ndimage.binary_fill_holes(alpha > 0.5)
-            alpha  = np.where(filled & ~fg_mask, alpha.max() * 0.8, alpha)
-        else:
-            alpha = fg_mask.astype(np.float32)
+        # 小クラスタ除去
+        labeled, num = ndimage.label((alpha > 0.5).astype(np.uint8))
+        if num > 0:
+            sizes = ndimage.sum(alpha > 0.5, labeled, range(1, num + 1))
+            for i, s in enumerate(sizes):
+                if s < self._MIN_CLUSTER_PX:
+                    alpha[labeled == (i + 1)] = 0
 
         return (alpha * 255).astype(np.uint8)
 
     # ================================================================
-    # ③ ポイント処理（ユーザー指定点からの除去）
+    # ③ SEGS: K-meansセグメンテーション（外部モデル不使用）
+    # ================================================================
+
+    def segment_segs(
+        self,
+        img_rgba: "np.ndarray",
+        n_clusters: int = 6,
+    ) -> "Dict[str, np.ndarray]":
+        """
+        K-meansクラスタリングによるSEGS（セグメンテーション）。
+        各セグメントのマスク配列を返す。
+
+        Returns:
+            dict: {"seg_0": mask_array, "seg_1": ..., ...}
+                  mask_arrayはuint8 (0 or 255) の2Dアレイ
+        """
+        if not _NUMPY_AVAILABLE:
+            return {}
+
+        h, w = img_rgba.shape[:2]
+        lab = self._rgb_to_lab(img_rgba[:, :, :3])
+
+        # 位置情報も加味（色+座標で空間的にまとまったクラスタを生成）
+        ys, xs = np.mgrid[0:h, 0:w]
+        ys_n = ys.astype(np.float32) / h * 20  # 位置の重みを色より低く
+        xs_n = xs.astype(np.float32) / w * 20
+        features = np.stack([
+            lab[:, :, 0], lab[:, :, 1], lab[:, :, 2], ys_n, xs_n
+        ], axis=2).reshape(-1, 5)
+
+        # 不透明ピクセルのみ対象
+        alpha = img_rgba[:, :, 3].reshape(-1)
+        opaque = alpha > 10
+        if opaque.sum() < n_clusters:
+            return {}
+
+        feat_valid = features[opaque]
+
+        # K-means（純粋numpy実装・ランダム初期化 + イテレーション）
+        labels_valid = self._kmeans_numpy(feat_valid, n_clusters, self._KMEANS_ITER)
+
+        # 全ピクセルにラベルを割り当て（透明は -1）
+        labels_full = np.full(h * w, -1, dtype=np.int32)
+        labels_full[opaque] = labels_valid
+
+        # 各クラスタのマスクを生成
+        segs: Dict[str, np.ndarray] = {}
+        for k in range(n_clusters):
+            mask = (labels_full == k).reshape(h, w).astype(np.uint8) * 255
+            if mask.sum() > 255:  # 空クラスタを除外
+                # ConnectedComponentsで最大連結成分を採用
+                if _SCIPY_AVAILABLE:
+                    labeled, _ = ndimage.label(mask > 128)
+                    if labeled.max() > 0:
+                        sizes = ndimage.sum(mask > 128, labeled, range(1, labeled.max() + 1))
+                        largest = np.argmax(sizes) + 1
+                        mask = (labeled == largest).astype(np.uint8) * 255
+                segs[f"seg_{k}"] = mask
+
+        return segs
+
+    def _kmeans_numpy(
+        self,
+        data: "np.ndarray",
+        k: int,
+        max_iter: int,
+    ) -> "np.ndarray":
+        """純粋numpy K-means（Lloyd法）"""
+        n = len(data)
+        # kmeans++ 初期化
+        centers = [data[np.random.randint(n)]]
+        for _ in range(k - 1):
+            d2 = np.array([min(((x - c) ** 2).sum() for c in centers) for x in data])
+            probs = d2 / d2.sum()
+            centers.append(data[np.random.choice(n, p=probs)])
+        centers = np.array(centers)
+
+        labels = np.zeros(n, dtype=np.int32)
+        for _ in range(max_iter):
+            # 距離計算（ベクトル化）
+            dists = np.sqrt(((data[:, np.newaxis, :] - centers[np.newaxis, :, :]) ** 2).sum(axis=2))
+            new_labels = dists.argmin(axis=1)
+            if (new_labels == labels).all():
+                break
+            labels = new_labels
+            for j in range(k):
+                mask = labels == j
+                if mask.any():
+                    centers[j] = data[mask].mean(axis=0)
+
+        return labels
+
+    # ================================================================
+    # ④ 部位検出（顔・肌・髪・服）外部モデル不使用
+    # ================================================================
+
+    def detect_body_parts(
+        self,
+        img_rgba: "np.ndarray",
+    ) -> "Dict[str, np.ndarray]":
+        """
+        YCbCr/HSV複合モデル + 形態学的解析による部位検出。
+        学習済みモデル不使用・純粋アルゴリズム。
+
+        Returns:
+            dict: {
+                "skin":     uint8 mask (0/255),  肌領域
+                "face":     uint8 mask (0/255),  顔推定領域
+                "hair":     uint8 mask (0/255),  髪領域
+                "clothing": uint8 mask (0/255),  服領域
+                "eye":      uint8 mask (0/255),  目・眉周辺（暗い顔内領域）
+            }
+        """
+        if not _NUMPY_AVAILABLE:
+            return {}
+
+        h, w = img_rgba.shape[:2]
+        rgb  = img_rgba[:, :, :3].astype(np.float32)
+        alpha_ch = img_rgba[:, :, 3]
+
+        # ── 肌検出 (YCbCr + HSV dual model) ──
+        skin_mask = self._detect_skin(rgb, h, w)
+
+        # 不透明領域のみ
+        opaque = alpha_ch > 10
+        skin_mask &= opaque
+
+        # ── 顔領域推定 ──
+        # 「上半分の肌の最大連結成分」＝顔
+        face_mask = self._estimate_face(skin_mask, h, w)
+
+        # ── 髪検出 ──
+        hair_mask = self._detect_hair(rgb, face_mask, skin_mask, h, w, opaque)
+
+        # ── 服検出 ──
+        clothing_mask = self._detect_clothing(skin_mask, hair_mask, face_mask, opaque, h, w)
+
+        # ── 目・眉領域（顔内の暗い小領域）──
+        eye_mask = self._detect_eyes(rgb, face_mask, h, w)
+
+        # 各マスクをモルフォロジー整形
+        if _SCIPY_AVAILABLE:
+            for mask in [skin_mask, face_mask, hair_mask, clothing_mask, eye_mask]:
+                mask[:] = ndimage.binary_closing(mask, np.ones((4, 4), bool))
+
+        return {
+            "skin":     (skin_mask * 255).astype(np.uint8),
+            "face":     (face_mask * 255).astype(np.uint8),
+            "hair":     (hair_mask * 255).astype(np.uint8),
+            "clothing": (clothing_mask * 255).astype(np.uint8),
+            "eye":      (eye_mask * 255).astype(np.uint8),
+        }
+
+    def _detect_skin(self, rgb: "np.ndarray", h: int, w: int) -> "np.ndarray":
+        """YCbCr + HSV 複合肌色検出（ベクトル化）"""
+        r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
+
+        # YCbCr変換
+        Y  =  0.299 * r + 0.587 * g + 0.114 * b
+        Cb = -0.1687 * r - 0.3313 * g + 0.5 * b + 128
+        Cr =  0.5 * r - 0.4187 * g - 0.0813 * b + 128
+
+        # Chai & Ngan 肌色範囲 (YCbCr)
+        skin_ycbcr = (
+            (Y > 80) & (Y < 240) &
+            (Cb > 85) & (Cb < 135) &
+            (Cr > 135) & (Cr < 180)
+        )
+
+        # HSV変換
+        rn, gn, bn = r / 255.0, g / 255.0, b / 255.0
+        cmax = np.maximum(np.maximum(rn, gn), bn)
+        cmin = np.minimum(np.minimum(rn, gn), bn)
+        delta = cmax - cmin + 1e-9
+
+        # Hue
+        H = np.where(cmax == rn, (gn - bn) / delta % 6,
+            np.where(cmax == gn, (bn - rn) / delta + 2,
+                                  (rn - gn) / delta + 4)) * 60
+        H[H < 0] += 360
+        S = np.where(cmax > 0, delta / (cmax + 1e-9), 0)
+        V = cmax
+
+        # HSV肌色範囲
+        skin_hsv = (
+            ((H >= 0) & (H <= 25) | (H >= 340) & (H <= 360)) &
+            (S >= 0.15) & (S <= 0.90) &
+            (V >= 0.30)
+        )
+
+        return (skin_ycbcr | skin_hsv)
+
+    def _estimate_face(
+        self,
+        skin_mask: "np.ndarray",
+        h: int, w: int,
+    ) -> "np.ndarray":
+        """
+        上半身の肌成分から顔を推定。
+        最大連結成分を顔とし、楕円フィッティングで精度向上。
+        """
+        if not _SCIPY_AVAILABLE:
+            return np.zeros((h, w), bool)
+
+        # 上60%領域の肌
+        upper = skin_mask.copy()
+        upper[int(h * 0.6):, :] = False
+
+        labeled, num = ndimage.label(upper)
+        if num == 0:
+            return np.zeros((h, w), bool)
+
+        sizes = ndimage.sum(upper, labeled, range(1, num + 1))
+        largest_idx = int(np.argmax(sizes)) + 1
+        face_raw = labeled == largest_idx
+
+        # バウンディングボックスを楕円マスクに変換（丸みを持たせる）
+        ys, xs = np.where(face_raw)
+        if len(ys) == 0:
+            return face_raw
+
+        cy_f = (ys.min() + ys.max()) // 2
+        cx_f = (xs.min() + xs.max()) // 2
+        ry_f = (ys.max() - ys.min()) // 2 + 8
+        rx_f = (xs.max() - xs.min()) // 2 + 8
+
+        ys_g, xs_g = np.mgrid[0:h, 0:w]
+        face_ellipse = ((xs_g - cx_f)**2 / max(rx_f, 1)**2
+                      + (ys_g - cy_f)**2 / max(ry_f, 1)**2) <= 1.05
+
+        # 楕円 AND 肌マスク
+        return face_ellipse & skin_mask
+
+    def _detect_hair(
+        self,
+        rgb: "np.ndarray",
+        face_mask: "np.ndarray",
+        skin_mask: "np.ndarray",
+        h: int, w: int,
+        opaque: "np.ndarray",
+    ) -> "np.ndarray":
+        """
+        顔の上の暗い領域を髪として検出。
+        肌でも背景でもない領域＋輝度が低い = 髪。
+        """
+        gray = 0.299 * rgb[:,:,0] + 0.587 * rgb[:,:,1] + 0.114 * rgb[:,:,2]
+
+        # 顔バウンディングボックスの上部を基準に
+        face_ys, _ = np.where(face_mask)
+        if len(face_ys) == 0:
+            return np.zeros((h, w), bool)
+
+        face_top = face_ys.min()
+        search_bottom = max(face_ys.max(), int(face_top + h * 0.3))
+
+        # 顔領域の輝度中央値
+        face_lum = gray[face_mask].mean() if face_mask.any() else 150.0
+        hair_threshold = face_lum * 0.55  # 顔より55%以上暗い = 髪
+
+        # 候補: 暗い + 非肌 + 不透明 + 顔より上または隣接
+        hair_cand = (
+            (gray < hair_threshold) &
+            (~skin_mask) &
+            opaque
+        )
+
+        # 顔の上の領域に限定（過剰検出を防ぐ）
+        region_mask = np.zeros((h, w), bool)
+        region_mask[:search_bottom, :] = True
+        hair_cand &= region_mask
+
+        if _SCIPY_AVAILABLE and hair_cand.any():
+            # 顔マスクと連結している成分のみ採用
+            combined = face_mask | hair_cand
+            dilated_face = ndimage.binary_dilation(face_mask, np.ones((10, 10), bool))
+            hair_cand &= dilated_face | hair_cand
+
+            # モルフォロジー整形
+            hair_cand = ndimage.binary_closing(hair_cand, np.ones((6, 6), bool))
+            hair_cand = ndimage.binary_fill_holes(hair_cand)
+
+        return hair_cand
+
+    def _detect_clothing(
+        self,
+        skin_mask: "np.ndarray",
+        hair_mask: "np.ndarray",
+        face_mask: "np.ndarray",
+        opaque: "np.ndarray",
+        h: int, w: int,
+    ) -> "np.ndarray":
+        """
+        服検出: 不透明 & 非肌 & 非髪 の領域。
+        """
+        clothing = opaque & ~skin_mask & ~hair_mask
+        if _SCIPY_AVAILABLE:
+            clothing = ndimage.binary_opening(clothing, np.ones((4, 4), bool))
+            clothing = ndimage.binary_closing(clothing, np.ones((8, 8), bool))
+        return clothing
+
+    def _detect_eyes(
+        self,
+        rgb: "np.ndarray",
+        face_mask: "np.ndarray",
+        h: int, w: int,
+    ) -> "np.ndarray":
+        """
+        顔領域内の暗い小領域（目・眉）を検出。
+        """
+        if not face_mask.any() or not _SCIPY_AVAILABLE:
+            return np.zeros((h, w), bool)
+
+        gray = 0.299 * rgb[:,:,0] + 0.587 * rgb[:,:,1] + 0.114 * rgb[:,:,2]
+        face_lum = gray[face_mask].mean()
+        eye_thresh = face_lum * 0.55
+
+        eye_cand = face_mask & (gray < eye_thresh)
+
+        # 顔の上半分に限定
+        face_ys, _ = np.where(face_mask)
+        if len(face_ys) == 0:
+            return eye_cand
+        face_mid = (face_ys.min() + face_ys.max()) // 2
+        eye_cand[face_mid:, :] = False
+
+        # 小成分のみ（目は小さい）
+        labeled, num = ndimage.label(eye_cand)
+        if num == 0:
+            return eye_cand
+        sizes = ndimage.sum(eye_cand, labeled, range(1, num + 1))
+        face_area = face_mask.sum()
+        result = np.zeros((h, w), bool)
+        for i, s in enumerate(sizes):
+            if 10 < s < face_area * 0.12:  # 顔面積の12%以下
+                result[labeled == (i + 1)] = True
+
+        return result
+
+    # ================================================================
+    # ⑤ ポイント処理
     # ================================================================
 
     def remove_by_point(
@@ -516,51 +950,27 @@ class AdvancedImageProcessor:
         radius: int = 20,
         sensitivity: float = 1.0,
     ) -> "np.ndarray":
-        """
-        指定ピクセル座標を起点に、色が近いピクセルを除去する。
-        フラッドフィル（塗りつぶし除去）方式。
-
-        Args:
-            img_rgba:    RGBA numpy配列
-            px, py:      除去起点のピクセル座標 (display座標 → 変換済み)
-            radius:      除去半径ヒント（色許容差に影響）
-            sensitivity: 除去感度
-        """
         if not _NUMPY_AVAILABLE:
             return img_rgba
-
         result = img_rgba.copy()
-        h, w   = result.shape[:2]
-
+        h, w = result.shape[:2]
         if not (0 <= py < h and 0 <= px < w):
             return result
 
-        # 基準色をサンプリング（指定点の周辺平均）
-        sr = max(0, py - 2)
-        er = min(h, py + 3)
-        sc = max(0, px - 2)
-        ec = min(w, px + 3)
+        sr, er = max(0, py - 2), min(h, py + 3)
+        sc, ec = max(0, px - 2), min(w, px + 3)
         seed_color = result[sr:er, sc:ec, :3].reshape(-1, 3).mean(axis=0)
 
-        # Lab色空間で色差計算
         lab = self._rgb_to_lab(result[:, :, :3])
-        seed_lab = self._rgb_to_lab(
-            seed_color.reshape(1, 1, 3).astype(np.uint8)
-        )[0, 0]
+        seed_lab = self._rgb_to_lab(seed_color.reshape(1, 1, 3).astype(np.uint8))[0, 0]
 
-        # 許容差を radius と sensitivity から決定
         tolerance = max(10.0, radius * 0.8) * sensitivity
-
-        # BFSフラッドフィル
-        diff   = np.sqrt(np.sum((lab - seed_lab) ** 2, axis=2))
+        diff = np.sqrt(np.sum((lab - seed_lab) ** 2, axis=2))
         is_similar = diff < tolerance
-        fill_mask  = self._bfs_flood_fill(is_similar, h, w)
+        fill_mask = self._bfs_from_point(is_similar, py, px, h, w)
+        if not fill_mask.any():
+            fill_mask = self._bfs_flood_fill(is_similar, h, w)
 
-        # 指定点が外周に隣接していない場合、指定点を起点にローカルBFS
-        if not fill_mask[py, px]:
-            fill_mask = self._bfs_from_point(is_similar, py, px, h, w)
-
-        # フェザリング付きで透明化
         if _SCIPY_AVAILABLE:
             dist = ndimage.distance_transform_edt(fill_mask).astype(np.float32)
             alpha_reduce = np.clip(dist / self._FEATHER_RADIUS, 0, 1)
@@ -570,374 +980,232 @@ class AdvancedImageProcessor:
 
         return result
 
-    def _bfs_from_point(
-        self,
-        is_similar: "np.ndarray",
-        start_y: int, start_x: int,
-        h: int, w: int,
-    ) -> "np.ndarray":
-        """指定点を起点としたBFSフラッドフィル"""
-        visited = np.zeros((h, w), dtype=bool)
-        if not is_similar[start_y, start_x]:
+    def _bfs_from_point(self, is_similar, sy, sx, h, w):
+        visited = np.zeros((h, w), bool)
+        if not is_similar[sy, sx]:
             return visited
-
-        q = deque([(start_y, start_x)])
-        visited[start_y, start_x] = True
+        q = deque([(sy, sx)])
+        visited[sy, sx] = True
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            pass
         nb4 = [(-1,0),(1,0),(0,-1),(0,1)]
         while q:
             r, c = q.popleft()
             for dr, dc in nb4:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and is_similar[nr, nc]:
-                    visited[nr, nc] = True
-                    q.append((nr, nc))
+                nr, nc = r+dr, c+dc
+                if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and is_similar[nr,nc]:
+                    visited[nr,nc] = True
+                    q.append((nr,nc))
+        return visited
+
+    def _bfs_flood_fill(self, is_bg, h, w):
+        visited = np.zeros((h, w), bool)
+        q = deque()
+        for r in range(h):
+            if not visited[r, 0] and is_bg[r, 0]:
+                visited[r, 0] = True; q.append((r, 0))
+            if not visited[r, w-1] and is_bg[r, w-1]:
+                visited[r, w-1] = True; q.append((r, w-1))
+        for c in range(w):
+            if not visited[0, c] and is_bg[0, c]:
+                visited[0, c] = True; q.append((0, c))
+            if not visited[h-1, c] and is_bg[h-1, c]:
+                visited[h-1, c] = True; q.append((h-1, c))
+        nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+        while q:
+            r, c = q.popleft()
+            for dr, dc in nb8:
+                nr, nc = r+dr, c+dc
+                if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and is_bg[nr,nc]:
+                    visited[nr,nc] = True; q.append((nr,nc))
         return visited
 
     # ================================================================
-    # ④ 選択範囲処理
+    # ⑥ 選択範囲除去・ブラシ編集
     # ================================================================
 
-    def remove_by_rect(
-        self,
-        img_rgba: "np.ndarray",
-        x1: int, y1: int, x2: int, y2: int,
-        mode: str = "hard",
-    ) -> "np.ndarray":
-        """
-        矩形選択範囲内のピクセルを除去する。
-
-        Args:
-            mode: "hard"=即時除去, "color"=色マッチング除去, "feather"=フェザリング除去
-        """
-        if not _NUMPY_AVAILABLE:
-            return img_rgba
-
+    def remove_by_rect(self, img_rgba, x1, y1, x2, y2, mode="hard"):
+        if not _NUMPY_AVAILABLE: return img_rgba
         result = img_rgba.copy()
-        h, w   = result.shape[:2]
-        rx1, ry1 = max(0, min(x1, x2)), max(0, min(y1, y2))
-        rx2, ry2 = min(w, max(x1, x2)), min(h, max(y1, y2))
-
+        h, w = result.shape[:2]
+        rx1, ry1 = max(0,min(x1,x2)), max(0,min(y1,y2))
+        rx2, ry2 = min(w,max(x1,x2)), min(h,max(y1,y2))
         if mode == "hard":
             result[ry1:ry2, rx1:rx2, 3] = 0
-        elif mode == "color":
-            region = result[ry1:ry2, rx1:rx2]
-            lab_r  = self._rgb_to_lab(region[:, :, :3])
-            lab_m  = lab_r.reshape(-1, 3).mean(axis=0)
-            diff   = np.sqrt(np.sum((lab_r - lab_m) ** 2, axis=2))
-            mask   = diff < 20
-            region[:, :, 3][mask] = 0
-            result[ry1:ry2, rx1:rx2] = region
-        elif mode == "feather":
-            if _SCIPY_AVAILABLE:
-                rect_mask = np.zeros((h, w), dtype=bool)
-                rect_mask[ry1:ry2, rx1:rx2] = True
-                dist = ndimage.distance_transform_edt(rect_mask).astype(np.float32)
-                alpha_fade = np.clip(1 - dist / 10, 0, 1)
-                result[:, :, 3] = (result[:, :, 3] * alpha_fade).astype(np.uint8)
-            else:
-                result[ry1:ry2, rx1:rx2, 3] = 0
-
+        elif mode == "feather" and _SCIPY_AVAILABLE:
+            rm = np.zeros((h,w), bool); rm[ry1:ry2, rx1:rx2] = True
+            dist = ndimage.distance_transform_edt(rm).astype(np.float32)
+            fade = np.clip(1 - dist / 12, 0, 1)
+            result[:,:,3] = (result[:,:,3] * fade).astype(np.uint8)
         return result
 
-    def remove_by_ellipse(
-        self,
-        img_rgba: "np.ndarray",
-        cx: int, cy: int, rx: int, ry: int,
-    ) -> "np.ndarray":
-        """楕円選択範囲内のピクセルを除去する。"""
-        if not _NUMPY_AVAILABLE:
-            return img_rgba
-
+    def remove_by_ellipse(self, img_rgba, cx, cy, rx, ry):
+        if not _NUMPY_AVAILABLE: return img_rgba
         result = img_rgba.copy()
-        h, w   = result.shape[:2]
+        h, w = result.shape[:2]
         ys, xs = np.mgrid[0:h, 0:w]
-        ellipse_mask = ((xs - cx)**2 / max(rx, 1)**2 + (ys - cy)**2 / max(ry, 1)**2) <= 1.0
-        result[:, :, 3][ellipse_mask] = 0
+        mask = ((xs-cx)**2/max(rx,1)**2 + (ys-cy)**2/max(ry,1)**2) <= 1.0
+        result[:,:,3][mask] = 0
         return result
 
-    def remove_by_lasso(
-        self,
-        img_rgba: "np.ndarray",
-        points: List[Tuple[int, int]],
-    ) -> "np.ndarray":
-        """
-        自由曲線（投げ縄）選択領域のピクセルを除去する。
-        点列を内外判定（Ray Casting）でマスク生成。
-        """
-        if not _NUMPY_AVAILABLE or len(points) < 3:
-            return img_rgba
-
+    def remove_by_lasso(self, img_rgba, points):
+        if not _NUMPY_AVAILABLE or len(points) < 3: return img_rgba
         result = img_rgba.copy()
-        h, w   = result.shape[:2]
-
-        # PIL DrawでポリゴンマスクをRasterize
+        h, w = result.shape[:2]
         if _PIL_AVAILABLE:
             mask_img = Image.new("L", (w, h), 0)
-            draw = ImageDraw.Draw(mask_img)
-            draw.polygon(points, fill=255)
-            lasso_mask = np.array(mask_img) > 128
-            result[:, :, 3][lasso_mask] = 0
-
+            ImageDraw.Draw(mask_img).polygon(points, fill=255)
+            result[:,:,3][np.array(mask_img) > 128] = 0
         return result
 
-    # ================================================================
-    # ⑤ マスク手動調整（ブラシ追加・消去）
-    # ================================================================
-
-    def apply_brush(
-        self,
-        img_rgba: "np.ndarray",
-        px: int, py: int,
-        brush_size: int = 15,
-        mode: str = "erase",
-    ) -> "np.ndarray":
-        """
-        ブラシで手動編集（消去または復元）。
-
-        Args:
-            mode: "erase"=透明化, "restore"=不透明化
-        """
-        if not _NUMPY_AVAILABLE:
-            return img_rgba
-
+    def apply_brush(self, img_rgba, px, py, brush_size=15, mode="erase"):
+        if not _NUMPY_AVAILABLE: return img_rgba
         result = img_rgba.copy()
-        h, w   = result.shape[:2]
+        h, w = result.shape[:2]
         ys, xs = np.mgrid[0:h, 0:w]
-        dist   = np.sqrt((xs - px)**2 + (ys - py)**2)
-        brush  = dist <= brush_size
-
-        # ソフトブラシ（距離に応じてフェード）
-        soft_alpha = np.clip(1 - dist / brush_size, 0, 1)
-        soft_alpha[~brush] = 0
-
+        dist = np.sqrt((xs-px)**2 + (ys-py)**2)
+        soft = np.clip(1 - dist/max(brush_size,1), 0, 1)
+        soft[dist > brush_size] = 0
         if mode == "erase":
-            result[:, :, 3] = (result[:, :, 3] * (1 - soft_alpha)).astype(np.uint8)
-        else:  # restore
-            result[:, :, 3] = np.clip(
-                result[:, :, 3] + (soft_alpha * 255), 0, 255
-            ).astype(np.uint8)
-
+            result[:,:,3] = (result[:,:,3]*(1-soft)).astype(np.uint8)
+        else:
+            result[:,:,3] = np.clip(result[:,:,3]+soft*255, 0, 255).astype(np.uint8)
         return result
 
     # ================================================================
-    # ⑥ 背景合成
+    # ⑦ 背景合成
     # ================================================================
 
-    def composite_with_background(
-        self,
-        fg_rgba: "np.ndarray",
-        bg_type: str = "checker",
-        bg_color: Tuple[int, int, int] = (100, 100, 200),
-        bg_image: Optional["np.ndarray"] = None,
-    ) -> "np.ndarray":
-        """
-        前景（透過済み）と背景を合成する。
-
-        Args:
-            bg_type: "checker"|"solid"|"gradient"|"image"
-        """
-        if not _NUMPY_AVAILABLE:
-            return fg_rgba
-
+    def composite_with_background(self, fg_rgba, bg_type="checker",
+                                   bg_color=(100,100,200), bg_image=None):
+        if not _NUMPY_AVAILABLE: return fg_rgba
         h, w = fg_rgba.shape[:2]
+        if bg_type == "checker":      bg = self._make_checker_array(w, h)
+        elif bg_type == "solid":      bg = np.full((h,w,4), (*bg_color,255), dtype=np.uint8)
+        elif bg_type == "gradient":   bg = self._make_gradient_array(w, h, bg_color)
+        elif bg_type == "image" and bg_image is not None: bg = self._resize_bg(bg_image, w, h)
+        else:                          bg = self._make_checker_array(w, h)
+        alpha = fg_rgba[:,:,3:4].astype(np.float32)/255.0
+        out = (fg_rgba[:,:,:3].astype(np.float32)*alpha +
+               bg[:,:,:3].astype(np.float32)*(1-alpha)).astype(np.uint8)
+        return np.dstack([out, np.full((h,w),255,dtype=np.uint8)])
 
-        if bg_type == "checker":
-            bg = self._make_checker_array(w, h)
-        elif bg_type == "solid":
-            bg = np.full((h, w, 4), (*bg_color, 255), dtype=np.uint8)
-        elif bg_type == "gradient":
-            bg = self._make_gradient_array(w, h, bg_color)
-        elif bg_type == "image" and bg_image is not None:
-            bg = self._resize_bg(bg_image, w, h)
-        else:
-            bg = self._make_checker_array(w, h)
-
-        # アルファブレンディング
-        alpha = fg_rgba[:, :, 3:4].astype(np.float32) / 255.0
-        out   = (fg_rgba[:, :, :3].astype(np.float32) * alpha +
-                 bg[:, :, :3].astype(np.float32) * (1 - alpha)).astype(np.uint8)
-        return np.dstack([out, np.full((h, w), 255, dtype=np.uint8)])
-
-    def _make_checker_array(self, w: int, h: int, size: int = 16) -> "np.ndarray":
-        arr = np.full((h, w, 4), 255, dtype=np.uint8)
-        for y in range(0, h, size):
-            for x in range(0, w, size):
-                if ((x // size) + (y // size)) % 2 == 1:
-                    arr[y:y+size, x:x+size, :3] = 180
+    def _make_checker_array(self, w, h, size=16):
+        arr = np.full((h,w,4), 255, dtype=np.uint8)
+        ys, xs = np.mgrid[0:h, 0:w]
+        checker = ((xs//size)+(ys//size)) % 2 == 1
+        arr[checker, :3] = 180
         return arr
 
-    def _make_gradient_array(
-        self,
-        w: int, h: int,
-        color: Tuple[int, int, int],
-    ) -> "np.ndarray":
-        arr = np.zeros((h, w, 4), dtype=np.uint8)
-        for y in range(h):
-            t = y / max(h - 1, 1)
-            r = int(color[0] * (1 - t) + 30 * t)
-            g = int(color[1] * (1 - t) + 30 * t)
-            b = int(color[2] * (1 - t) + 60 * t)
-            arr[y, :, :3] = [r, g, b]
-        arr[:, :, 3] = 255
+    def _make_gradient_array(self, w, h, color):
+        arr = np.zeros((h,w,4), dtype=np.uint8)
+        t = np.linspace(0, 1, h)[:, np.newaxis]
+        arr[:,:,0] = (color[0]*(1-t) + 30*t).clip(0,255)
+        arr[:,:,1] = (color[1]*(1-t) + 30*t).clip(0,255)
+        arr[:,:,2] = (color[2]*(1-t) + 60*t).clip(0,255)
+        arr[:,:,3] = 255
         return arr
 
-    def _resize_bg(self, bg: "np.ndarray", w: int, h: int) -> "np.ndarray":
-        if not _PIL_AVAILABLE:
-            return np.full((h, w, 4), (100, 100, 100, 255), dtype=np.uint8)
-        img = Image.fromarray(bg).convert("RGBA").resize((w, h), Image.LANCZOS)
-        return np.array(img)
+    def _resize_bg(self, bg, w, h):
+        if not _PIL_AVAILABLE: return np.full((h,w,4),(100,100,100,255),dtype=np.uint8)
+        return np.array(Image.fromarray(bg).convert("RGBA").resize((w,h), Image.LANCZOS))
 
     # ================================================================
-    # ⑥-B Inpaint（マスク領域の穴埋め補完）独自実装
+    # ⑧ Inpaint（独自重み付き補完）
     # ================================================================
 
-    def inpaint_region(
-        self,
-        img_rgba: "np.ndarray",
-        mask: "np.ndarray",
-        radius: int = 8,
-    ) -> "np.ndarray":
-        """
-        マスク領域を周囲のピクセルで補完する（Inpaint）。
-        ComfyUI/Impact Pack的な「マスク→穴埋め」機能を独自実装。
-
-        アルゴリズム:
-          1. マスク境界を外側から内側へ同心円状に走査
-          2. 各ピクセルを有効な近傍ピクセルの加重平均で補完
-          3. 距離に応じた重み付け（近い画素を優先）
-          4. 複数回イタレーションで品質向上
-
-        Args:
-            img_rgba: RGBA numpy配列
-            mask:     補完対象マスク (True=補完する領域)
-            radius:   補完参照半径
-
-        Returns:
-            補完済み RGBA numpy配列
-        """
-        if not _NUMPY_AVAILABLE:
-            return img_rgba
-
+    def inpaint_region(self, img_rgba, mask, radius=8):
+        if not _NUMPY_AVAILABLE: return img_rgba
         result = img_rgba.copy().astype(np.float32)
-        h, w   = result.shape[:2]
-        fill   = mask.copy()
-
-        # 境界ピクセルから内側へ反復補完（Telea法近似）
-        max_iter = max(h, w) // 2
-        for iteration in range(max_iter):
-            changed = False
-            # 補完すべきピクセルのうち、有効な隣接ピクセルがあるものを処理
+        h, w = result.shape[:2]
+        fill = mask.copy()
+        for _ in range(max(h,w)//2):
             ys, xs = np.where(fill)
-            if len(ys) == 0:
-                break
-
+            if len(ys) == 0: break
+            changed = False
             for y, x in zip(ys, xs):
-                # 参照半径内の有効ピクセルを収集
-                y0 = max(0, y - radius)
-                y1 = min(h, y + radius + 1)
-                x0 = max(0, x - radius)
-                x1 = min(w, x + radius + 1)
-
-                region_valid = ~fill[y0:y1, x0:x1]
-                if not region_valid.any():
-                    continue
-
-                # 距離加重平均で補完
+                y0,y1 = max(0,y-radius), min(h,y+radius+1)
+                x0,x1 = max(0,x-radius), min(w,x+radius+1)
+                valid = ~fill[y0:y1, x0:x1]
+                if not valid.any(): continue
                 ry, rx = np.mgrid[y0:y1, x0:x1]
-                dist   = np.sqrt((ry - y)**2 + (rx - x)**2) + 1e-6
-                weight = (1.0 / dist**2) * region_valid.astype(np.float32)
-                w_sum  = weight.sum()
-
-                if w_sum < 1e-6:
-                    continue
-
+                dist = np.sqrt((ry-y)**2+(rx-x)**2)+1e-6
+                weight = (1/dist**2)*valid
+                ws = weight.sum()
+                if ws < 1e-6: continue
                 for ch in range(4):
-                    val = (result[y0:y1, x0:x1, ch] * weight).sum() / w_sum
-                    result[y, x, ch] = val
-
-                fill[y, x] = False
-                changed = True
-
-            if not changed:
-                break
-
+                    result[y,x,ch] = (result[y0:y1,x0:x1,ch]*weight).sum()/ws
+                fill[y,x] = False; changed = True
+            if not changed: break
         return np.clip(result, 0, 255).astype(np.uint8)
 
-    def create_inpaint_mask_from_alpha(self, img_rgba: "np.ndarray") -> "np.ndarray":
-        """
-        アルファチャンネルから Inpaint マスクを生成する。
-        透明領域（除去済み領域）をInpaint対象として返す。
-        """
-        if not _NUMPY_AVAILABLE:
-            return np.zeros(img_rgba.shape[:2], dtype=bool)
-        return img_rgba[:, :, 3] < 128
+    def create_inpaint_mask_from_alpha(self, img_rgba):
+        if not _NUMPY_AVAILABLE: return np.zeros(img_rgba.shape[:2], bool)
+        return img_rgba[:,:,3] < 128
 
     # ================================================================
-    # ⑦ 全セル一括処理ユーティリティ
+    # ⑨ 一括処理ユーティリティ
     # ================================================================
 
-    def process_all_cells(
-        self,
-        sheet_img: "Image.Image",
-        rows: int,
-        cols: int,
-        pose_names: List[str],
-        on_progress: Optional[Callable[[int, int, str], None]] = None,
-    ) -> Dict[str, "Image.Image"]:
-        """
-        スプライトシートの全セルを一括処理して返す。
-        背景除去・クロップ・正規化を自動適用。
-        """
-        if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
-            return {}
-
+    def process_all_cells(self, sheet_img, rows, cols, pose_names, on_progress=None):
+        if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE: return {}
         results = {}
-        total = len(pose_names)
         arr = np.array(sheet_img.convert("RGBA"))
         h, w = arr.shape[:2]
-        cw, ch = w // cols, h // rows
-
+        cw, ch = w//cols, h//rows
+        total = len(pose_names)
         for i, name in enumerate(pose_names):
-            if on_progress:
-                on_progress(i + 1, total, f"処理中: {name}")
-            row = i // cols
-            col = i % cols
-            cell_arr = arr[row*ch:(row+1)*ch, col*cw:(col+1)*cw]
+            if on_progress: on_progress(i+1, total, f"処理中: {name}")
+            row, col = i//cols, i%cols
+            cell = arr[row*ch:(row+1)*ch, col*cw:(col+1)*cw]
             try:
-                removed = self.remove_background_adaptive(cell_arr)
+                removed = self.remove_background_adaptive(cell)
                 cropped = self._autocrop_array(removed)
                 norm    = self._normalize_array(cropped)
                 results[name] = Image.fromarray(norm)
             except Exception as e:
                 logger.error(f"セル '{name}' 処理エラー: {e}")
-
         return results
 
-    def _autocrop_array(self, arr: "np.ndarray", padding: int = 20) -> "np.ndarray":
-        """透明余白を自動クロップ"""
-        alpha = arr[:, :, 3]
+    def _autocrop_array(self, arr, padding=20):
+        alpha = arr[:,:,3]
         mask  = alpha > 10
-        if not mask.any():
-            return arr
-        rows = np.any(mask, axis=1)
-        cols = np.any(mask, axis=0)
-        rmin = max(0, int(np.where(rows)[0][0])  - padding)
-        rmax = min(arr.shape[0] - 1, int(np.where(rows)[0][-1]) + padding)
-        cmin = max(0, int(np.where(cols)[0][0])  - padding)
-        cmax = min(arr.shape[1] - 1, int(np.where(cols)[0][-1]) + padding)
+        if not mask.any(): return arr
+        rows = np.any(mask, axis=1); cols = np.any(mask, axis=0)
+        rmin = max(0, int(np.where(rows)[0][0]) - padding)
+        rmax = min(arr.shape[0]-1, int(np.where(rows)[0][-1]) + padding)
+        cmin = max(0, int(np.where(cols)[0][0]) - padding)
+        cmax = min(arr.shape[1]-1, int(np.where(cols)[0][-1]) + padding)
         return arr[rmin:rmax+1, cmin:cmax+1]
 
-    def _normalize_array(self, arr: "np.ndarray", size: int = 2048) -> "np.ndarray":
-        """正方形キャンバスに正規化（upscale対応）"""
-        if not _PIL_AVAILABLE:
-            return arr
+    def _normalize_array(self, arr, size=2048):
+        if not _PIL_AVAILABLE: return arr
         img = Image.fromarray(arr)
-        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        scale  = min(size / img.width, size / img.height)
-        nw, nh = int(img.width * scale), int(img.height * scale)
-        resized = img.resize((nw, nh), Image.LANCZOS)
-        canvas.paste(resized, ((size - nw) // 2, (size - nh) // 2), resized)
+        canvas = Image.new("RGBA", (size,size), (0,0,0,0))
+        scale = min(size/img.width, size/img.height)
+        nw, nh = int(img.width*scale), int(img.height*scale)
+        resized = img.resize((nw,nh), Image.LANCZOS)
+        canvas.paste(resized, ((size-nw)//2, (size-nh)//2), resized)
         return np.array(canvas)
+
+    # ================================================================
+    # ⑩ 色空間変換ユーティリティ
+    # ================================================================
+
+    def _rgb_to_lab(self, rgb):
+        rgb_f = rgb.astype(np.float32) / 255.0
+        linear = np.where(rgb_f > 0.04045,
+                          ((rgb_f + 0.055) / 1.055) ** 2.4,
+                          rgb_f / 12.92)
+        r, g, b = linear[:,:,0], linear[:,:,1], linear[:,:,2]
+        x = r*0.4124 + g*0.3576 + b*0.1805
+        y = r*0.2126 + g*0.7152 + b*0.0722
+        z = r*0.0193 + g*0.1192 + b*0.9505
+        def f(t):
+            delta = 6/29
+            return np.where(t > delta**3, t**(1/3), t/(3*delta**2)+4/29)
+        fx, fy, fz = f(x/0.9505), f(y/1.0000), f(z/1.0890)
+        return np.stack([116*fy-16, 500*(fx-fy), 200*(fy-fz)], axis=2)
 
 
 # ================================================================== #
@@ -986,11 +1254,11 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._processor   = AdvancedImageProcessor()
 
         # 状態管理
-        self._src_image:    Optional[Image.Image] = None   # 元画像
-        self._work_arr:     Optional["np.ndarray"] = None  # 現在の編集配列
-        self._history_stack: List["np.ndarray"] = []       # Undo履歴
-        self._result_image: Optional[Image.Image] = None   # 最終結果
-        self._bg_image:     Optional["np.ndarray"] = None  # 合成用背景
+        self._src_image:    Optional[Image.Image] = None
+        self._work_arr:     Optional["np.ndarray"] = None
+        self._history_stack: List["np.ndarray"] = []
+        self._result_image: Optional[Image.Image] = None
+        self._bg_image:     Optional["np.ndarray"] = None
 
         # ツール状態
         self._current_tool = self._TOOL_POINT
@@ -1009,6 +1277,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         # 処理フラグ
         self._processing = False
+
+        # エッジ表示フラグ
+        self._edge_showing = False
+        self._edge_arr: Optional["np.ndarray"] = None
 
         # バッチ処理結果
         self._batch_results: Dict[str, Image.Image] = {}
@@ -1036,6 +1308,15 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
     def _build_ui(self):
         c = self._c
+
+        # ----------------------------------------------------------------
+        # 【修正】ステータスバー用 StringVar をここで先に作成する。
+        # _build_toolbar() の末尾で _select_tool() が呼ばれ、その中で
+        # _tool_info_var / _coord_var を参照するため、ツールバー構築より
+        # 前に初期化しておく必要がある。
+        # ----------------------------------------------------------------
+        self._coord_var     = tk.StringVar(value="X:- Y:-")
+        self._tool_info_var = tk.StringVar(value="ツール: ポイント除去")
 
         # ── メインレイアウト: 左ツールバー | 中央プレビュー | 右パネル ──
         main = tk.Frame(self, bg=c.bg_primary)
@@ -1142,7 +1423,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         rf = tk.Frame(paned, bg=c.bg_primary)
         paned.add(rf, weight=1)
 
-        # 背景選択ヘッダー
         hdr = tk.Frame(rf, bg=c.bg_primary)
         hdr.pack(fill="x", padx=2)
         tk.Label(hdr, text="処理後プレビュー  背景:", bg=c.bg_primary,
@@ -1170,7 +1450,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         )
         self._canvas_result.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # TkImage保持用
         self._tk_src:    Optional[ImageTk.PhotoImage] = None
         self._tk_result: Optional[ImageTk.PhotoImage] = None
 
@@ -1180,7 +1459,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         rp.pack(side="right", fill="y", padx=(2, 0))
         rp.pack_propagate(False)
 
-        # スクロール可能エリア
         canvas_rp = tk.Canvas(rp, bg=c.bg_secondary, highlightthickness=0)
         sb_rp     = ttk.Scrollbar(rp, orient="vertical", command=canvas_rp.yview)
         canvas_rp.configure(yscrollcommand=sb_rp.set)
@@ -1230,7 +1508,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                    buttonbackground=c.bg_tertiary).grid(row=0, column=3, padx=4)
         self._btn(inner, c, "一括処理実行", self._run_batch_process).pack(fill="x", padx=10, pady=2)
 
-        # バッチ結果リスト
         tk.Label(inner, text="処理済みセル:", bg=c.bg_secondary, fg=c.text_secondary,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=10)
         self._batch_listbox = tk.Listbox(
@@ -1243,20 +1520,111 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         sep()
 
-        # ── エッジ検出 ──
-        section("🔍 エッジ検出")
-        self._btn(inner, c, "エッジを表示", self._show_edges).pack(fill="x", padx=10, pady=2)
+        # ── SEGS: K-meansセグメンテーション ──
+        section("🔬 SEGS（自動セグメント）")
+        tk.Label(inner, text="K-means色クラスタリング\n各領域を自動分割して選択可能にします",
+                 bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=10)
+        seg_row = tk.Frame(inner, bg=c.bg_secondary)
+        seg_row.pack(fill="x", padx=10, pady=2)
+        tk.Label(seg_row, text="クラスタ数:", bg=c.bg_secondary,
+                 fg=c.text_secondary, font=("Segoe UI", 8)).pack(side="left")
+        self._seg_k_var = tk.IntVar(value=6)
+        tk.Spinbox(seg_row, from_=2, to=12, textvariable=self._seg_k_var,
+                   width=3, bg=c.bg_tertiary, fg=c.text_primary,
+                   buttonbackground=c.bg_tertiary, font=("Segoe UI", 9)).pack(side="left", padx=4)
+        self._seg_btn = self._btn(inner, c, "🔬 SEGS 実行", self._run_segs)
+        self._seg_btn.pack(fill="x", padx=10, pady=2)
+        self._seg_progress = ttk.Progressbar(inner, mode="indeterminate", length=200)
+        self._seg_loading_label = tk.Label(inner, text="", bg=c.bg_secondary,
+                                           fg=c.accent_primary, font=("Segoe UI", 8))
+        self._seg_progress.pack(padx=10, pady=2)
+        self._seg_loading_label.pack(padx=10)
+        self._seg_progress.pack_forget()
+        self._seg_loading_label.pack_forget()
+        # セグメント一覧
+        tk.Label(inner, text="検出セグメント（クリックで選択→除去）:",
+                 bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=10)
+        self._seg_listbox = tk.Listbox(
+            inner, height=5, bg=c.bg_tertiary, fg=c.text_primary,
+            selectbackground=c.accent_primary, relief="flat",
+            font=("Segoe UI", 8), selectmode="extended",
+        )
+        self._seg_listbox.pack(fill="x", padx=10, pady=2)
+        seg_act_row = tk.Frame(inner, bg=c.bg_secondary)
+        seg_act_row.pack(fill="x", padx=10, pady=2)
+        self._btn(seg_act_row, c, "選択セグ除去", self._remove_selected_segs).pack(side="left", padx=2)
+        self._btn(seg_act_row, c, "選択セグ保持", self._keep_selected_segs).pack(side="left", padx=2)
+        self._segs_data: Dict[str, "np.ndarray"] = {}
 
         sep()
 
-        # ── 保存先ポーズ ──
+        # ── 部位検出 ──
+        section("👤 部位検出（顔・肌・髪・服）")
+        tk.Label(inner, text="YCbCr+HSV複合モデル\n学習済みモデル不使用の純粋アルゴリズム",
+                 bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=10)
+        self._parts_btn = self._btn(inner, c, "👤 部位検出 実行", self._run_body_parts)
+        self._parts_btn.pack(fill="x", padx=10, pady=2)
+        self._parts_progress = ttk.Progressbar(inner, mode="indeterminate", length=200)
+        self._parts_loading_label = tk.Label(inner, text="", bg=c.bg_secondary,
+                                             fg=c.accent_primary, font=("Segoe UI", 8))
+        self._parts_progress.pack(padx=10, pady=2)
+        self._parts_loading_label.pack(padx=10)
+        self._parts_progress.pack_forget()
+        self._parts_loading_label.pack_forget()
+        # 部位ボタン群
+        tk.Label(inner, text="検出した部位を操作:", bg=c.bg_secondary,
+                 fg=c.text_secondary, font=("Segoe UI", 8)).pack(anchor="w", padx=10)
+        parts_grid = tk.Frame(inner, bg=c.bg_secondary)
+        parts_grid.pack(fill="x", padx=10, pady=4)
+        self._part_btns: Dict[str, tk.Button] = {}
+        for i, (key, label, color) in enumerate([
+            ("skin",     "🟡 肌",   "#f59e0b"),
+            ("face",     "🔵 顔",   "#3b82f6"),
+            ("hair",     "🟤 髪",   "#92400e"),
+            ("clothing", "🟢 服",   "#10b981"),
+            ("eye",      "⚫ 目",   "#6b7280"),
+        ]):
+            col_i = i % 2
+            row_i = i // 2
+            btn = tk.Button(
+                parts_grid, text=f"{label}\n除去", width=8,
+                command=lambda k=key: self._remove_body_part(k),
+                bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                font=("Segoe UI", 8), pady=4, cursor="hand2",
+                state="disabled",
+            )
+            btn.grid(row=row_i, column=col_i, padx=2, pady=2, sticky="ew")
+            self._part_btns[key] = btn
+        parts_grid.columnconfigure(0, weight=1)
+        parts_grid.columnconfigure(1, weight=1)
+        self._btn(inner, c, "部位プレビュー表示", self._show_parts_preview).pack(fill="x", padx=10, pady=2)
+        self._parts_data: Dict[str, "np.ndarray"] = {}
+
+        sep()
+
+        # ── エッジ検出 ──
+        section("🔍 エッジ検出")
+        self._edge_btn = self._btn(inner, c, "🔍 エッジを表示", self._toggle_edges)
+        self._edge_btn.pack(fill="x", padx=10, pady=2)
+        # エッジ検出専用プログレスバー（処理中のみ表示）
+        self._edge_progress = ttk.Progressbar(inner, mode="indeterminate", length=200)
+        self._edge_loading_label = tk.Label(
+            inner, text="", bg=c.bg_secondary, fg=c.accent_primary,
+            font=("Segoe UI", 8),
+        )
+        # 初期は非表示
+        self._edge_progress.pack(padx=10, pady=2)
+        self._edge_loading_label.pack(padx=10)
+        self._edge_progress.pack_forget()
+        self._edge_loading_label.pack_forget()
+
+        sep()
+
+        # ── 保存設定 ──
         section("💾 保存設定")
-        tk.Label(inner, text="ポーズ名:", bg=c.bg_secondary, fg=c.text_secondary,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=10)
-        self._pose_var = tk.StringVar(value="default")
-        ttk.Combobox(inner, textvariable=self._pose_var,
-                     values=self._POSES, state="readonly",
-                     font=("Segoe UI", 10)).pack(fill="x", padx=10, pady=2)
 
         tk.Label(inner, text="カスタムファイル名 (任意):", bg=c.bg_secondary,
                  fg=c.text_secondary, font=("Segoe UI", 9)).pack(anchor="w", padx=10)
@@ -1279,7 +1647,7 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         sep()
 
-        # ── Inpaint（穴埋め補完）──
+        # ── Inpaint ──
         section("🔨 Inpaint（穴埋め補完）")
         tk.Label(inner, text="除去した領域を周囲のピクセルで\n自動補完します",
                  bg=c.bg_secondary, fg=c.text_muted,
@@ -1295,7 +1663,7 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         sep()
 
-        # ── アニメーション作成へ連携 ──
+        # ── アニメーション作成 ──
         section("🎬 アニメーション作成")
         tk.Label(inner, text="処理済み画像をアニメーション\n作成ツールへ送ります",
                  bg=c.bg_secondary, fg=c.text_muted,
@@ -1314,15 +1682,18 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                  fg=c.text_muted, font=("Segoe UI", 8),
                  wraplength=240, justify="left").pack(padx=10, pady=4)
 
-
     def _build_status_bar(self, c):
+        """
+        下部ステータスバー。
+        _coord_var / _tool_info_var は _build_ui() 冒頭で作成済みなので
+        ここでは Label を生成するだけ（StringVar の重複生成をしない）。
+        """
         sb = tk.Frame(self, bg=c.bg_secondary, height=24)
         sb.pack(fill="x", side="bottom")
         sb.pack_propagate(False)
-        self._coord_var = tk.StringVar(value="X:- Y:-")
+        # 【修正】StringVar はすでに _build_ui() で作成済みのためここでは作らない
         tk.Label(sb, textvariable=self._coord_var, bg=c.bg_secondary,
                  fg=c.text_muted, font=("Consolas", 8)).pack(side="left", padx=8)
-        self._tool_info_var = tk.StringVar(value="ツール: ポイント除去")
         tk.Label(sb, textvariable=self._tool_info_var, bg=c.bg_secondary,
                  fg=c.text_muted, font=("Segoe UI", 8)).pack(side="right", padx=8)
 
@@ -1445,29 +1816,39 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 self._refresh_all_previews()
 
         elif self._current_tool == self._TOOL_LASSO and self._lasso_drawing:
-            # ダブルクリック相当: release で確定
-            pass  # ダブルクリックで確定（別バインド）
+            pass  # ダブルクリックで確定
 
     # ================================================================
     # プレビュー描画
     # ================================================================
 
     def _redraw_src(self):
-        """元画像（+ 操作ガイド）をキャンバスに描画"""
-        if not _PIL_AVAILABLE or self._src_image is None:
+        """作業画像（編集中の状態・透明部分はチェッカー表示）をキャンバスに描画"""
+        if not _PIL_AVAILABLE:
             return
-        self._draw_to_canvas(self._canvas_src, self._src_image, "_tk_src",
-                             checker=False)
+        if self._work_arr is not None and _NUMPY_AVAILABLE:
+            img = Image.fromarray(self._work_arr)
+            self._draw_to_canvas(self._canvas_src, img, "_tk_src", checker=True)
+        elif self._src_image is not None:
+            self._draw_to_canvas(self._canvas_src, self._src_image, "_tk_src", checker=False)
 
     def _redraw_src_with_selection(self):
-        """選択範囲オーバーレイ付きで元画像を描画"""
+        """選択範囲オーバーレイ付きで作業画像を描画"""
         self._redraw_src()
         c = self._canvas_src
         cw, ch = c.winfo_width(), c.winfo_height()
 
-        if self._src_image is None:
+        # 描画基準となる画像のサイズを取得
+        base_img = None
+        if self._work_arr is not None and _NUMPY_AVAILABLE:
+            bh, bw = self._work_arr.shape[:2]
+            base_img = (bw, bh)
+        elif self._src_image is not None:
+            base_img = (self._src_image.width, self._src_image.height)
+
+        if base_img is None:
             return
-        h, w = self._src_image.height, self._src_image.width
+        w, h = base_img
         scale = min(cw / max(w,1), ch / max(h,1)) * 0.95
         ox    = (cw - w * scale) / 2
         oy    = (ch - h * scale) / 2
@@ -1571,7 +1952,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._TOOL_BRUSH_RESTORE:"復元ブラシ",
         }
         self._tool_info_var.set(f"ツール: {tool_names.get(tool_id, tool_id)}")
-        # 投げ縄をリセット
         self._lasso_points = []
         self._lasso_drawing = False
 
@@ -1757,16 +2137,279 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._processing = False
         self._set_status(f"エラー: {msg}", error=True)
 
+    # ================================================================
+    # SEGS（K-meansセグメンテーション）
+    # ================================================================
+
+    def _run_segs(self):
+        if self._work_arr is None:
+            self._set_status("画像を開いてください", error=True)
+            return
+        if self._processing:
+            return
+        self._processing = True
+        self._seg_btn.configure(state="disabled", text="⏳ 分析中...")
+        self._seg_progress.pack(padx=10, pady=2)
+        self._seg_loading_label.configure(text="⏳ K-meansクラスタリング中...")
+        self._seg_loading_label.pack(padx=10)
+        self._seg_progress.start(10)
+        k = self._seg_k_var.get()
+        threading.Thread(target=self._do_segs, args=(k,), daemon=True).start()
+
+    def _do_segs(self, k: int):
+        try:
+            segs = self._processor.segment_segs(self._work_arr, n_clusters=k)
+            self.after(0, self._on_segs_done, segs)
+        except Exception as e:
+            self.after(0, self._on_segs_error, str(e))
+
+    def _on_segs_done(self, segs: "Dict[str, np.ndarray]"):
+        self._seg_progress.stop()
+        self._seg_progress.pack_forget()
+        self._seg_loading_label.pack_forget()
+        self._seg_btn.configure(state="normal", text="🔬 SEGS 実行")
+        self._processing = False
+        self._segs_data = segs
+        self._seg_listbox.delete(0, "end")
+        for name in segs:
+            px_count = int(segs[name].sum() // 255)
+            self._seg_listbox.insert("end", f"{name}  ({px_count:,}px)")
+        self._set_status(f"SEGS完了: {len(segs)} セグメント検出")
+        # カラーオーバーレイをプレビューに表示
+        self._show_segs_overlay(segs)
+
+    def _on_segs_error(self, msg: str):
+        self._seg_progress.stop()
+        self._seg_progress.pack_forget()
+        self._seg_loading_label.pack_forget()
+        self._seg_btn.configure(state="normal", text="🔬 SEGS 実行")
+        self._processing = False
+        self._set_status(f"SEGSエラー: {msg}", error=True)
+
+    def _show_segs_overlay(self, segs: dict):
+        """セグメントを色分けしてプレビューに表示"""
+        if not _PIL_AVAILABLE or self._work_arr is None or not _NUMPY_AVAILABLE:
+            return
+        h, w = self._work_arr.shape[:2]
+        overlay = self._work_arr.copy()
+        colors = [
+            (255, 80,  80,  120),
+            (80,  255, 80,  120),
+            (80,  80,  255, 120),
+            (255, 255, 80,  120),
+            (255, 80,  255, 120),
+            (80,  255, 255, 120),
+            (200, 120, 50,  120),
+            (120, 200, 50,  120),
+            (50,  120, 200, 120),
+            (200, 50,  120, 120),
+            (120, 50,  200, 120),
+            (50,  200, 120, 120),
+        ]
+        for i, (name, mask) in enumerate(segs.items()):
+            col = colors[i % len(colors)]
+            m = mask > 128
+            for ch, val in enumerate(col[:3]):
+                overlay[:, :, ch] = np.where(m,
+                    np.clip(overlay[:, :, ch].astype(np.int32) + val // 3, 0, 255),
+                    overlay[:, :, ch])
+        img = Image.fromarray(overlay)
+        self._draw_to_canvas(self._canvas_result, img, "_tk_result", checker=True)
+
+    def _remove_selected_segs(self):
+        """選択したセグメントを除去"""
+        sel = self._seg_listbox.curselection()
+        if not sel or self._work_arr is None or not _NUMPY_AVAILABLE:
+            return
+        self._push_history()
+        keys = list(self._segs_data.keys())
+        for idx in sel:
+            if idx < len(keys):
+                mask = self._segs_data[keys[idx]]
+                self._work_arr[:, :, 3][mask > 128] = 0
+        self._refresh_all_previews()
+        self._set_status(f"{len(sel)} セグメントを除去しました")
+
+    def _keep_selected_segs(self):
+        """選択したセグメントのみ保持（それ以外を除去）"""
+        sel = self._seg_listbox.curselection()
+        if not sel or self._work_arr is None or not _NUMPY_AVAILABLE:
+            return
+        self._push_history()
+        keys = list(self._segs_data.keys())
+        keep_mask = np.zeros(self._work_arr.shape[:2], dtype=bool)
+        for idx in sel:
+            if idx < len(keys):
+                keep_mask |= (self._segs_data[keys[idx]] > 128)
+        self._work_arr[:, :, 3][~keep_mask] = 0
+        self._refresh_all_previews()
+        self._set_status(f"{len(sel)} セグメントのみ保持しました")
+
+    # ================================================================
+    # 部位検出（顔・肌・髪・服）
+    # ================================================================
+
+    def _run_body_parts(self):
+        if self._work_arr is None:
+            self._set_status("画像を開いてください", error=True)
+            return
+        if self._processing:
+            return
+        self._processing = True
+        self._parts_btn.configure(state="disabled", text="⏳ 検出中...")
+        self._parts_progress.pack(padx=10, pady=2)
+        self._parts_loading_label.configure(text="⏳ YCbCr+HSV部位解析中...")
+        self._parts_loading_label.pack(padx=10)
+        self._parts_progress.start(10)
+        threading.Thread(target=self._do_body_parts, daemon=True).start()
+
+    def _do_body_parts(self):
+        try:
+            parts = self._processor.detect_body_parts(self._work_arr)
+            self.after(0, self._on_body_parts_done, parts)
+        except Exception as e:
+            self.after(0, self._on_body_parts_error, str(e))
+
+    def _on_body_parts_done(self, parts: "Dict[str, np.ndarray]"):
+        self._parts_progress.stop()
+        self._parts_progress.pack_forget()
+        self._parts_loading_label.pack_forget()
+        self._parts_btn.configure(state="normal", text="👤 部位検出 実行")
+        self._processing = False
+        self._parts_data = parts
+        # 検出された部位のボタンをアクティブ化
+        detected = []
+        _label_map = {"skin":"🟡 肌","face":"🔵 顔","hair":"🟤 髪","clothing":"🟢 服","eye":"⚫ 目"}
+        for key, mask in parts.items():
+            px = int(mask.sum() // 255)
+            state = "normal" if px > 50 else "disabled"
+            if key in self._part_btns:
+                lbl = _label_map.get(key, key)
+                self._part_btns[key].configure(
+                    state=state,
+                    text=f"{lbl}\n{px:,}px",
+                )
+            if px > 50:
+                detected.append(key)
+        self._set_status(f"部位検出完了: {', '.join(detected) if detected else '未検出'}")
+        self._show_parts_preview()
+
+    def _on_body_parts_error(self, msg: str):
+        self._parts_progress.stop()
+        self._parts_progress.pack_forget()
+        self._parts_loading_label.pack_forget()
+        self._parts_btn.configure(state="normal", text="👤 部位検出 実行")
+        self._processing = False
+        self._set_status(f"部位検出エラー: {msg}", error=True)
+
+    def _show_parts_preview(self):
+        """部位をカラーオーバーレイで表示"""
+        if not self._parts_data or self._work_arr is None or not _NUMPY_AVAILABLE or not _PIL_AVAILABLE:
+            return
+        h, w = self._work_arr.shape[:2]
+        overlay = self._work_arr.copy()
+        color_map = {
+            "skin":     (255, 200, 100),
+            "face":     (100, 150, 255),
+            "hair":     (140,  80,  20),
+            "clothing": ( 80, 200, 120),
+            "eye":      ( 50,  50,  50),
+        }
+        for key, mask in self._parts_data.items():
+            col = color_map.get(key, (200, 200, 200))
+            m = mask > 128
+            if not m.any():
+                continue
+            for ch, val in enumerate(col):
+                ch_data = overlay[:, :, ch].astype(np.int32)
+                overlay[:, :, ch] = np.where(m,
+                    np.clip((ch_data * 0.5 + val * 0.5).astype(np.int32), 0, 255),
+                    ch_data).astype(np.uint8)
+        img = Image.fromarray(overlay)
+        self._draw_to_canvas(self._canvas_result, img, "_tk_result", checker=True)
+        self._set_status("部位プレビュー表示中（黄=肌 青=顔 茶=髪 緑=服 黒=目）")
+
+    def _remove_body_part(self, part_key: str):
+        """指定部位を除去"""
+        if part_key not in self._parts_data or self._work_arr is None or not _NUMPY_AVAILABLE:
+            self._set_status(f"先に部位検出を実行してください", error=True)
+            return
+        mask = self._parts_data[part_key]
+        if mask.sum() == 0:
+            self._set_status(f"{part_key} は検出されていません")
+            return
+        self._push_history()
+        self._work_arr[:, :, 3][mask > 128] = 0
+        self._refresh_all_previews()
+        label_map = {"skin": "肌", "face": "顔", "hair": "髪", "clothing": "服", "eye": "目"}
+        self._set_status(f"{label_map.get(part_key, part_key)} を除去しました")
+
+    def _toggle_edges(self):
+        """エッジ表示のON/OFF切り替え"""
+        if self._edge_showing:
+            self._hide_edges()
+        else:
+            self._show_edges()
+
     def _show_edges(self):
+        """エッジ検出をバックグラウンドスレッドで実行（UI非フリーズ）"""
         if self._work_arr is None:
             return
         if not _NUMPY_AVAILABLE:
             self._set_status("numpyが必要です", error=True)
             return
-        edge_map = self._processor.detect_edges_highquality(self._work_arr)
-        edge_img = Image.fromarray(edge_map).convert("RGBA")
-        self._draw_to_canvas(self._canvas_result, edge_img, "_tk_result")
-        self._set_status("エッジ検出マップを表示中")
+        if self._processing:
+            return
+
+        # プログレスバーを表示
+        self._edge_progress.pack(padx=10, pady=2)
+        self._edge_loading_label.configure(text="⏳ エッジ検出中...")
+        self._edge_loading_label.pack(padx=10)
+        self._edge_progress.start(10)
+        self._edge_btn.configure(text="⏳ 検出中...", state="disabled")
+
+        threading.Thread(target=self._do_edge_detection, daemon=True).start()
+
+    def _do_edge_detection(self):
+        """バックグラウンドスレッドでエッジ検出を実行"""
+        try:
+            edge_map = self._processor.detect_edges_highquality(self._work_arr)
+            self.after(0, self._on_edge_done, edge_map)
+        except Exception as e:
+            self.after(0, self._on_edge_error, str(e))
+
+    def _on_edge_done(self, edge_map: "np.ndarray"):
+        """エッジ検出完了 → 結果プレビューに表示"""
+        self._edge_arr = edge_map
+        self._edge_showing = True
+        # プログレスバーを非表示
+        self._edge_progress.stop()
+        self._edge_progress.pack_forget()
+        self._edge_loading_label.configure(text="")
+        self._edge_loading_label.pack_forget()
+        self._edge_btn.configure(text="✅ エッジ非表示にする", state="normal",
+                                 bg=self._c.accent_success if hasattr(self._c, 'accent_success') else "#4ade80")
+        # エッジマップを右プレビューに表示
+        edge_rgba = Image.fromarray(edge_map).convert("RGBA")
+        self._draw_to_canvas(self._canvas_result, edge_rgba, "_tk_result")
+        self._set_status("エッジ検出完了 | 「エッジ非表示にする」で通常プレビューに戻ります")
+
+    def _on_edge_error(self, msg: str):
+        self._edge_progress.stop()
+        self._edge_progress.pack_forget()
+        self._edge_loading_label.pack_forget()
+        self._edge_btn.configure(text="🔍 エッジを表示", state="normal",
+                                 bg=self._c.bg_tertiary)
+        self._set_status(f"エッジ検出エラー: {msg}", error=True)
+
+    def _hide_edges(self):
+        """エッジ表示をOFFにして通常の処理後プレビューに戻す"""
+        self._edge_showing = False
+        self._edge_arr = None
+        self._edge_btn.configure(text="🔍 エッジを表示",
+                                 bg=self._c.bg_tertiary)
+        self._refresh_result_preview()
+        self._set_status("エッジ表示を終了しました")
 
     # ================================================================
     # 保存処理（確認ダイアログ付き）
@@ -1776,7 +2419,7 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         if self._work_arr is None:
             return
         result_img = Image.fromarray(self._work_arr)
-        self._show_save_dialog({"single": result_img})
+        self._show_save_dialog({"output": result_img})
 
     def _save_batch_with_confirm(self):
         if not self._batch_results:
@@ -1784,16 +2427,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._show_save_dialog(self._batch_results)
 
     def _show_save_dialog(self, images: Dict[str, Image.Image]):
-        """
-        保存確認ダイアログ。
-        - 保存する / しない の選択
-        - 保存先フォルダ選択
-        - カスタム名 / 連番名の選択
-        - ポーズ名マッピング（単体の場合）
-        """
+        """保存確認ダイアログ。"""
         dlg = tk.Toplevel(self)
         dlg.title("保存確認")
-        dlg.geometry("500x420")
+        dlg.geometry("500x380")
         dlg.configure(bg=self._c.bg_primary)
         dlg.transient(self)
         dlg.grab_set()
@@ -1808,7 +2445,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                  bg=c.bg_primary, fg=c.text_secondary,
                  font=("Segoe UI", 10)).pack()
 
-        # 保存先フォルダ
         tk.Label(dlg, text="保存先フォルダ:", bg=c.bg_primary, fg=c.text_secondary,
                  font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(12, 0))
         dir_frame = tk.Frame(dlg, bg=c.bg_primary)
@@ -1825,55 +2461,44 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         ), bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
                   font=("Segoe UI", 9), padx=6, pady=3, cursor="hand2").pack(side="left", padx=4)
 
-        # 命名モード
-        tk.Label(dlg, text="ファイル命名:", bg=c.bg_primary, fg=c.text_secondary,
+        tk.Label(dlg, text="ファイル名:", bg=c.bg_primary, fg=c.text_secondary,
                  font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(10, 0))
-        name_mode = tk.StringVar(value="pose")
-        modes = [
-            ("pose",     "ポーズ名 (alice_default 等)"),
-            ("custom",   "カスタム名"),
-            ("sequence", "連番 (image_001, image_002...)"),
-        ]
+
         if len(images) > 1:
+            name_mode = tk.StringVar(value="sequence")
             modes = [("sequence", "連番 (image_001, image_002...)"),
                      ("custom_prefix", "プレフィックス + 連番")]
+        else:
+            name_mode = tk.StringVar(value="custom")
+            modes = [("custom", "カスタム名 (下記フィールドを使用)")]
+
         for val, lbl in modes:
             tk.Radiobutton(dlg, text=lbl, variable=name_mode, value=val,
                            bg=c.bg_primary, fg=c.text_secondary,
                            selectcolor=c.bg_tertiary,
                            font=("Segoe UI", 9)).pack(anchor="w", padx=30)
 
-        # カスタム名入力
-        tk.Label(dlg, text="カスタム名 / プレフィックス:",
+        tk.Label(dlg, text="ファイル名 / プレフィックス:",
                  bg=c.bg_primary, fg=c.text_secondary,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(6, 0))
-        custom_var = tk.StringVar(value=self._custom_name_var.get()
-                                  or self._POSE_FILE_MAP.get(self._pose_var.get(), "output"))
+        custom_var = tk.StringVar(value=self._custom_name_var.get() or "output")
         tk.Entry(dlg, textvariable=custom_var, bg=c.bg_tertiary,
                  fg=c.text_primary, insertbackground=c.text_primary,
                  relief="flat", font=("Segoe UI", 10), highlightthickness=1,
                  highlightbackground=c.border).pack(fill="x", padx=20, ipady=3)
 
-        # ボタン行
         btn_row = tk.Frame(dlg, bg=c.bg_primary)
         btn_row.pack(pady=16)
 
         def _do_save():
             dest_dir = Path(dir_var.get())
             dest_dir.mkdir(parents=True, exist_ok=True)
-            mode     = name_mode.get()
-            custom   = custom_var.get().strip() or "output"
-            pose_key = self._pose_var.get()
-            saved = []
+            mode   = name_mode.get()
+            custom = custom_var.get().strip() or "output"
+            saved  = []
 
             try:
-                if len(images) == 1 and mode == "pose":
-                    # ポーズ名で保存
-                    fname = self._POSE_FILE_MAP.get(pose_key, custom) + ".png"
-                    path  = dest_dir / fname
-                    list(images.values())[0].save(path, "PNG")
-                    saved.append(str(path))
-                elif mode in ("custom", "pose"):
+                if mode == "custom":
                     fname = custom + ".png"
                     path  = dest_dir / fname
                     list(images.values())[0].save(path, "PNG")
@@ -1895,7 +2520,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 self._set_status(f"保存完了: {len(saved)} 枚 → {dest_dir}")
                 logger.info(f"画像保存: {saved}")
 
-                # CharacterLoader リロード
                 if self._char_loader is not None:
                     self._char_loader.reload()
                 if self._on_reload is not None:
@@ -1924,10 +2548,7 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
     # ================================================================
 
     def _run_inpaint(self):
-        """
-        現在の作業画像の透明領域（除去済み部分）を
-        周囲のピクセルで Inpaint（穴埋め補完）する。
-        """
+        """現在の作業画像の透明領域を周囲のピクセルで Inpaint する。"""
         if self._work_arr is None:
             self._set_status("画像を開いてください", error=True)
             return
@@ -1969,30 +2590,23 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._processing = False
 
     def _open_animation_from_here(self):
-        """
-        現在の処理済み画像（または一括処理結果）を
-        AnimationCompositeDialog に渡してアニメーション作成へ移行する。
-        """
-        # 現在の work_arr から PIL Image を作成
+        """処理済み画像を AnimationCompositeDialog へ渡す。"""
         import_images: Dict[str, "Image.Image"] = {}
 
         if self._batch_results:
             import_images = dict(self._batch_results)
         elif self._work_arr is not None and _PIL_AVAILABLE and _NUMPY_AVAILABLE:
-            pose = self._pose_var.get() if hasattr(self, "_pose_var") else "default"
-            import_images[pose] = Image.fromarray(self._work_arr)
+            import_images["output"] = Image.fromarray(self._work_arr)
 
         if not import_images:
             self._set_status("アニメーションに送る画像がありません", error=True)
             return
 
-        # AnimationCompositeDialog を開く
         dlg = AnimationCompositeDialog(
             self.master,
             char_loader=self._char_loader,
         )
 
-        # 処理済み画像を自動レイヤーとして追加
         def _after_open():
             for name, img in import_images.items():
                 dlg._add_layer(img, name)
@@ -2030,45 +2644,27 @@ class BgRemovalDialog(AdvancedBgRemovalDialog):
 class AnimationCompositeDialog(tk.Toplevel):
     """
     パーツと被写体を合成して新しいキャラクターアニメーションを作成するダイアログ。
-
-    機能:
-      1. レイヤー管理（背景・被写体・前景パーツの重ね合わせ）
-      2. パーツ位置・スケール・不透明度の調整
-      3. アニメーションフレーム管理（複数フレーム構成）
-      4. フレームプレビュー（コマ送り再生）
-      5. GIF / 連番PNG 書き出し（外部ライブラリ不要）
-      6. Inpaint統合（除去した穴を補完してから合成）
-
-    独自アルゴリズム:
-      - アルファブレンディング（Porter-Duff Over 合成）
-      - 双線形補間リサイズ（PIL LANCZOS）
-      - フレーム差分圧縮（GIF Palette量子化）
     """
 
-    # フレームのデフォルト設定
     _DEFAULT_FPS   = 12
-    _DEFAULT_DELAY = 83   # ms (≒12fps)
+    _DEFAULT_DELAY = 83
 
     def __init__(self, parent, char_loader=None):
         super().__init__(parent)
         self._char_loader = char_loader
         self._processor   = AdvancedImageProcessor()
 
-        # レイヤー管理
-        self._layers: List[Dict] = []          # 各レイヤー: {name, img, x, y, scale, alpha, visible}
+        self._layers: List[Dict] = []
         self._selected_layer: Optional[int] = None
 
-        # フレーム管理
-        self._frames: List["np.ndarray"] = []  # 合成済みフレーム一覧
+        self._frames: List["np.ndarray"] = []
         self._current_frame: int = 0
         self._playing: bool = False
         self._fps = self._DEFAULT_FPS
 
-        # キャンバスサイズ
         self._canvas_w = 512
         self._canvas_h = 512
 
-        # TkImage保持
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
 
         self._setup_theme()
@@ -2087,10 +2683,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         except Exception:
             theme_name = "dark"
         self._c = Theme.get(theme_name)
-
-    # ================================================================
-    # UI構築
-    # ================================================================
 
     def _build_ui(self):
         c = self._c
@@ -2111,7 +2703,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         tk.Label(lp, text="📋 レイヤー", bg=c.bg_secondary, fg=c.accent_primary,
                  font=("Segoe UI", 11, "bold")).pack(pady=(10, 4), padx=8, anchor="w")
 
-        # レイヤー追加ボタン群
         btn_row = tk.Frame(lp, bg=c.bg_secondary)
         btn_row.pack(fill="x", padx=6, pady=2)
         for txt, cmd in [("+ 画像", self._add_layer_from_file),
@@ -2123,7 +2714,6 @@ class AnimationCompositeDialog(tk.Toplevel):
                       cursor="hand2", activebackground=c.accent_primary,
                       ).pack(side="left", padx=1)
 
-        # レイヤーリスト
         self._layer_listbox = tk.Listbox(
             lp, bg=c.bg_tertiary, fg=c.text_primary, selectbackground=c.accent_primary,
             relief="flat", font=("Segoe UI", 9), height=8,
@@ -2131,7 +2721,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         self._layer_listbox.pack(fill="x", padx=6, pady=4)
         self._layer_listbox.bind("<<ListboxSelect>>", self._on_layer_select)
 
-        # レイヤー順序変更
         ord_row = tk.Frame(lp, bg=c.bg_secondary)
         ord_row.pack(fill="x", padx=6)
         for txt, cmd in [("↑ 上へ", self._move_layer_up), ("↓ 下へ", self._move_layer_down)]:
@@ -2142,7 +2731,6 @@ class AnimationCompositeDialog(tk.Toplevel):
 
         tk.Frame(lp, bg=c.border, height=1).pack(fill="x", padx=6, pady=8)
 
-        # レイヤープロパティ
         tk.Label(lp, text="🔧 レイヤー設定", bg=c.bg_secondary, fg=c.accent_primary,
                  font=("Segoe UI", 10, "bold")).pack(padx=8, anchor="w")
 
@@ -2171,7 +2759,6 @@ class AnimationCompositeDialog(tk.Toplevel):
                   font=("Segoe UI", 9), padx=8, pady=4, cursor="hand2",
                   ).pack(fill="x", padx=8, pady=4)
 
-        # Inpaint ボタン
         tk.Frame(lp, bg=c.border, height=1).pack(fill="x", padx=6, pady=4)
         tk.Label(lp, text="🔨 Inpaint（穴埋め）", bg=c.bg_secondary, fg=c.accent_primary,
                  font=("Segoe UI", 10, "bold")).pack(padx=8, anchor="w")
@@ -2189,7 +2776,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         tk.Label(ca, text="🎨 合成プレビュー", bg=c.bg_primary, fg=c.text_secondary,
                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=4)
 
-        # キャンバスサイズ選択
         sz_row = tk.Frame(ca, bg=c.bg_primary)
         sz_row.pack(fill="x", padx=4)
         tk.Label(sz_row, text="サイズ:", bg=c.bg_primary, fg=c.text_secondary,
@@ -2224,7 +2810,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         def sep():
             tk.Frame(rp, bg=c.border, height=1).pack(fill="x", padx=10, pady=4)
 
-        # ── フレーム操作 ──
         section("🎬 フレーム管理")
         frame_row = tk.Frame(rp, bg=c.bg_secondary)
         frame_row.pack(fill="x", padx=10, pady=2)
@@ -2243,7 +2828,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         self._frame_listbox.pack(fill="x", padx=10, pady=2)
         self._frame_listbox.bind("<<ListboxSelect>>", self._on_frame_select)
 
-        # フレームコピー
         tk.Button(rp, text="現在の合成をフレームに追加",
                   command=self._capture_frame,
                   bg=c.accent_secondary, fg=c.text_primary, relief="flat",
@@ -2252,7 +2836,6 @@ class AnimationCompositeDialog(tk.Toplevel):
 
         sep()
 
-        # ── 再生 ──
         section("▶ プレビュー再生")
         fps_row = tk.Frame(rp, bg=c.bg_secondary)
         fps_row.pack(fill="x", padx=10)
@@ -2280,7 +2863,6 @@ class AnimationCompositeDialog(tk.Toplevel):
 
         sep()
 
-        # ── 書き出し ──
         section("💾 書き出し")
         tk.Button(rp, text="🎞 GIF アニメ書き出し",
                   command=self._export_gif,
@@ -2300,7 +2882,6 @@ class AnimationCompositeDialog(tk.Toplevel):
 
         sep()
 
-        # ステータス
         self._anim_status_var = tk.StringVar(value="レイヤーを追加してください")
         tk.Label(rp, textvariable=self._anim_status_var, bg=c.bg_secondary,
                  fg=c.text_muted, font=("Segoe UI", 8),
@@ -2408,7 +2989,6 @@ class AnimationCompositeDialog(tk.Toplevel):
             return
         i = self._selected_layer
         self._layers[i], self._layers[i-1] = self._layers[i-1], self._layers[i]
-        name = self._layers[i-1]["name"]
         self._layer_listbox.delete(i-1, i)
         self._layer_listbox.insert(i-1, self._layers[i-1]["name"])
         self._layer_listbox.insert(i,   self._layers[i]["name"])
@@ -2457,7 +3037,6 @@ class AnimationCompositeDialog(tk.Toplevel):
     # ================================================================
 
     def _inpaint_selected_layer(self):
-        """選択レイヤーの透明領域をInpaintで補完する"""
         if self._selected_layer is None or not _NUMPY_AVAILABLE or not _PIL_AVAILABLE:
             return
         layer = self._layers[self._selected_layer]
@@ -2489,10 +3068,7 @@ class AnimationCompositeDialog(tk.Toplevel):
     # ================================================================
 
     def _composite_all_layers(self) -> Optional["Image.Image"]:
-        """
-        全レイヤーを下から上へ Porter-Duff Over 合成して返す。
-        独自アルファブレンディング実装。
-        """
+        """全レイヤーを下から上へ Porter-Duff Over 合成して返す。"""
         if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
             return None
 
@@ -2510,10 +3086,8 @@ class AnimationCompositeDialog(tk.Toplevel):
             scaled = img.resize((nw, nh), Image.LANCZOS)
             arr    = np.array(scaled).astype(np.float32)
 
-            # レイヤーアルファを適用
             arr[:, :, 3] = arr[:, :, 3] * (layer["alpha"] / 255.0)
 
-            # キャンバスへの貼り付け座標
             lx = layer["x"]
             ly = layer["y"]
             cx0 = max(0, lx)
@@ -2528,7 +3102,6 @@ class AnimationCompositeDialog(tk.Toplevel):
             if cx0 >= cx1 or cy0 >= cy1:
                 continue
 
-            # Porter-Duff Over: dst = src + dst * (1 - src_alpha)
             src_region = arr[sy0:sy1, sx0:sx1]
             dst_region = canvas[cy0:cy1, cx0:cx1]
             src_a = src_region[:, :, 3:4] / 255.0
@@ -2565,7 +3138,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         ch = canvas.winfo_height()
         if cw <= 1 or ch <= 1:
             return
-        # チェッカー背景で透明度を可視化
         bg = Image.new("RGBA", (cw, ch), (40, 40, 60, 255))
         sz = 12
         draw = ImageDraw.Draw(bg)
@@ -2599,7 +3171,6 @@ class AnimationCompositeDialog(tk.Toplevel):
     # ================================================================
 
     def _add_frame(self):
-        """空フレームを追加"""
         if not _NUMPY_AVAILABLE:
             return
         frame = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.uint8)
@@ -2617,7 +3188,6 @@ class AnimationCompositeDialog(tk.Toplevel):
         self._update_frame_info()
 
     def _capture_frame(self):
-        """現在の合成結果をフレームとして追加"""
         if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
             return
         img = self._composite_all_layers()
@@ -2680,7 +3250,6 @@ class AnimationCompositeDialog(tk.Toplevel):
     # ================================================================
 
     def _export_gif(self):
-        """フレームをGIFアニメとして書き出す"""
         if not self._frames:
             messagebox.showwarning("警告", "フレームがありません", parent=self)
             return
@@ -2703,7 +3272,6 @@ class AnimationCompositeDialog(tk.Toplevel):
             pil_frames = []
             for arr in self._frames:
                 img = Image.fromarray(arr).convert("RGBA")
-                # GIF は RGB+パレット → RGBA → P変換
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 bg.paste(img, mask=img.split()[3])
                 pil_frames.append(bg.convert("P", palette=Image.ADAPTIVE, colors=256))
@@ -2720,7 +3288,6 @@ class AnimationCompositeDialog(tk.Toplevel):
             messagebox.showerror("エラー", str(e), parent=self)
 
     def _export_png_sequence(self):
-        """フレームを連番PNGとして書き出す"""
         if not self._frames:
             messagebox.showwarning("警告", "フレームがありません", parent=self)
             return
@@ -2749,12 +3316,10 @@ class AnimationCompositeDialog(tk.Toplevel):
             messagebox.showerror("エラー", str(e), parent=self)
 
     def _export_current_frame(self):
-        """現在フレームを単体PNGで保存"""
         if not self._frames:
             messagebox.showwarning("警告", "フレームがありません", parent=self)
             return
 
-        # 保存確認
         if not messagebox.askyesno("確認", "現在のフレームをPNGとして保存しますか？", parent=self):
             return
 
@@ -2775,6 +3340,9 @@ class AnimationCompositeDialog(tk.Toplevel):
             messagebox.showerror("エラー", str(e), parent=self)
 
 
+# ================================================================== #
+# 設定ダイアログ
+# ================================================================== #
 
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, env_binder, on_save: Optional[Callable] = None):
@@ -3080,8 +3648,6 @@ class AliceMainWindow:
         except queue.Empty:
             pass
         self.root.after(50, self._process_queue)
-
-    # ---- ウィンドウセットアップ ----
 
     def _setup_window(self):
         layout = get_layout(self._mode)
@@ -3445,7 +4011,7 @@ class AliceMainWindow:
         self._update_status("キャラクターを再読み込みしました。")
 
     def _open_advanced_image_tool(self):
-        """高度な画像処理ツールを開く（旧 BgRemovalDialog を置き換え）"""
+        """高度な画像処理ツールを開く"""
         dlg = AdvancedBgRemovalDialog(
             self.root,
             char_loader=self._char_loader,
