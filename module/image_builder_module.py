@@ -2,16 +2,16 @@
 image_builder_module.py
 スプライトシートからキャラクター画像を生成する外装モジュール。
 
-修正点（v3）:
-  - autocrop() 追加: 背景除去後の透明余白を自動トリミング
-  - normalize() 修正: thumbnail()（縮小専用）→ resize()（拡大対応）
-  - remove_bg() : 黒背景・チェッカー柄の両対応（四隅自動判定）
+変更点（v4）:
+  - AdvancedImageProcessor（window_module.py）と連携
+  - 独自アルゴリズムによる高精度背景除去・エッジ検出を使用
+  - autocrop / normalize は processor 内部メソッドに委譲
+  - 後方互換性のため remove_bg() / autocrop() / _normalize() は保持
 """
 
 from __future__ import annotations
 
 import threading
-from collections import deque
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -37,6 +37,15 @@ except ImportError:
     logger.error("Pillow / numpy が未インストールです。pip install Pillow numpy を実行してください。")
 
 
+def _get_processor():
+    """AdvancedImageProcessor を遅延インポートして返す（循環インポート防止）。"""
+    try:
+        from module.window_module import AdvancedImageProcessor
+        return AdvancedImageProcessor()
+    except ImportError:
+        return None
+
+
 class ImageBuilder:
     """スプライトシートからキャラクター画像を生成するクラス。"""
 
@@ -47,6 +56,7 @@ class ImageBuilder:
         self._cols = cols
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._processor = _get_processor()
 
     def build(self, pose_map: Optional[Dict[int, str]] = None,
               on_progress: Optional[Callable[[int, int, str], None]] = None) -> Dict[str, bool]:
@@ -70,9 +80,20 @@ class ImageBuilder:
                 if cell is None:
                     results[name] = False
                     continue
-                nobg    = remove_bg(cell)
-                cropped = autocrop(nobg)
-                norm    = _normalize(cropped)
+
+                if self._processor is not None and self._processor.is_available():
+                    # AdvancedImageProcessor を使用
+                    arr = np.array(cell.convert("RGBA"))
+                    removed_arr = self._processor.remove_background_adaptive(arr)
+                    cropped_arr = self._processor._autocrop_array(removed_arr)
+                    norm_arr    = self._processor._normalize_array(cropped_arr, OUTPUT_SIZE)
+                    norm        = Image.fromarray(norm_arr)
+                else:
+                    # フォールバック: 既存アルゴリズム
+                    nobg    = remove_bg(cell)
+                    cropped = autocrop(nobg)
+                    norm    = _normalize(cropped)
+
                 out_path = self._output_dir / f"{name}.png"
                 norm.save(out_path, "PNG")
                 results[name] = True
@@ -86,10 +107,19 @@ class ImageBuilder:
         if not _PIL_AVAILABLE:
             return False
         try:
-            img  = Image.open(image_path).convert("RGBA")
-            nobg = remove_bg(img)
-            cropped = autocrop(nobg)
-            norm = _normalize(cropped)
+            img = Image.open(image_path).convert("RGBA")
+
+            if self._processor is not None and self._processor.is_available():
+                arr         = np.array(img)
+                removed_arr = self._processor.remove_background_adaptive(arr)
+                cropped_arr = self._processor._autocrop_array(removed_arr)
+                norm_arr    = self._processor._normalize_array(cropped_arr, OUTPUT_SIZE)
+                norm        = Image.fromarray(norm_arr)
+            else:
+                nobg = remove_bg(img)
+                cropped = autocrop(nobg)
+                norm = _normalize(cropped)
+
             out_path = self._output_dir / f"{output_name}.png"
             norm.save(out_path, "PNG")
             return True
@@ -143,22 +173,42 @@ class ImageBuilder:
         ch = sheet.height // self._rows
         return sheet.crop((col*cw, row*ch, (col+1)*cw, (row+1)*ch))
 
-    # 後方互換性エイリアス
     def _remove_checker_bg(self, img):
+        """後方互換エイリアス"""
         return remove_bg(img)
 
 
 # ============================================================
-# モジュール公開関数
+# モジュール公開関数（後方互換性のため保持）
 # ============================================================
 
 def remove_bg(img: "Image.Image") -> "Image.Image":
     """
-    背景タイプを四隅サンプルから自動判定し、BFSで透過化する。
-    対応: 暗色(黒)背景 / チェッカー・グレー・白系背景
+    背景除去（後方互換）。
+    AdvancedImageProcessor が利用可能な場合はそちらを優先使用。
     """
     if not _PIL_AVAILABLE:
         return img
+
+    processor = _get_processor()
+    if processor is not None and processor.is_available():
+        try:
+            arr = np.array(img.convert("RGBA"))
+            result_arr = processor.remove_background_adaptive(arr)
+            return Image.fromarray(result_arr)
+        except Exception as e:
+            logger.warning(f"AdvancedImageProcessor 失敗、フォールバック使用: {e}")
+
+    # フォールバック: 旧BFSアルゴリズム
+    return _remove_bg_legacy(img)
+
+
+def _remove_bg_legacy(img: "Image.Image") -> "Image.Image":
+    """旧来のBFS背景除去（フォールバック用）。"""
+    if not _PIL_AVAILABLE:
+        return img
+
+    from collections import deque
 
     if img.mode == "RGBA":
         import numpy as np_
@@ -181,21 +231,19 @@ def remove_bg(img: "Image.Image") -> "Image.Image":
 
     if avg_bright < 40:
         is_bg = np.max(rgb, axis=2) < 50
-        logger.debug(f"背景タイプ: 黒(avg={avg_bright:.0f})")
     else:
         drg = np.abs(rgb[:, :, 0] - rgb[:, :, 1])
         dgb = np.abs(rgb[:, :, 1] - rgb[:, :, 2])
         is_gray = (drg < 30) & (dgb < 30)
         lum = (rgb[:, :, 0] + rgb[:, :, 1] + rgb[:, :, 2]) // 3
         is_bg = is_gray & (lum > 120)
-        logger.debug(f"背景タイプ: チェッカー/グレー(avg={avg_bright:.0f})")
 
     visited = np.zeros((h, w), dtype=bool)
-    queue: deque = deque()
+    q: deque = deque()
 
     def seed(r, c):
         if not visited[r, c] and is_bg[r, c]:
-            visited[r, c] = True; queue.append((r, c))
+            visited[r, c] = True; q.append((r, c))
 
     for r in range(h):
         seed(r, 0); seed(r, w - 1)
@@ -203,26 +251,20 @@ def remove_bg(img: "Image.Image") -> "Image.Image":
         seed(0, c); seed(h - 1, c)
 
     nb = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-    while queue:
-        r, c = queue.popleft()
+    while q:
+        r, c = q.popleft()
         for dr, dc in nb:
             nr, nc = r + dr, c + dc
             if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and is_bg[nr, nc]:
-                visited[nr, nc] = True; queue.append((nr, nc))
+                visited[nr, nc] = True; q.append((nr, nc))
 
     arr[:, :, 3][visited] = 0
-    logger.debug(f"背景除去: {visited.sum():,}px")
+    logger.debug(f"背景除去(legacy): {visited.sum():,}px")
     return Image.fromarray(arr)
 
 
 def autocrop(img: "Image.Image", padding: int = 20) -> "Image.Image":
-    """
-    透明ピクセルを除いた最小バウンディングボックスでクロップする。
-
-    ★ これが v2 で欠けていた重要な処理。
-    背景除去後の余白を詰めることで normalize() での拡大率が最大化され、
-    小さいセル（顔アイコン等）がキャンバス全体に正しく広がる。
-    """
+    """透明余白を自動クロップ（後方互換）。"""
     if not _PIL_AVAILABLE:
         return img
 
@@ -251,15 +293,10 @@ def autocrop(img: "Image.Image", padding: int = 20) -> "Image.Image":
 
 
 def _normalize(img: "Image.Image", size: int = OUTPUT_SIZE) -> "Image.Image":
-    """
-    size x size に正規化（アスペクト比保持・upscale対応・透明パディング）。
-
-    ★ thumbnail()（縮小専用）→ resize()（拡大対応）に変更。
-    """
+    """正規化（後方互換）。"""
     if not _PIL_AVAILABLE:
         return img
     from PIL import Image as _Image
-    import numpy as np
     canvas = _Image.new("RGBA", (size, size), (0, 0, 0, 0))
     iw, ih = img.width, img.height
     if iw == 0 or ih == 0:
@@ -278,7 +315,7 @@ def is_available() -> bool:
     return _PIL_AVAILABLE
 
 def is_rembg_available() -> bool:
-    """後方互換性のため残す。本モジュールは rembg を使用しない。"""
+    """後方互換性のため残す。"""
     return False
 
 def get_output_size() -> int:

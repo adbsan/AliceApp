@@ -1,13 +1,14 @@
 """
 window_module.py
 Alice AI メインGUIウィンドウ。
-キャラクターアニメーション、チャット表示、設定、Git管理を提供する。
+キャラクターアニメーション、チャット表示、設定、Git管理、高度な画像処理を提供する。
 
 責務:
   - メインウィンドウの構築・表示
   - ユーザー入力の受け付けと AliceEngine への委譲
   - キャラクターアニメーションの制御
   - 設定ダイアログ・Git ダイアログの提供
+  - 高度な画像処理（背景除去・ポイント処理・範囲選択・エッジ検出・合成）
 
 制約:
   - 推論を実行しない（AliceEngine に委譲）
@@ -22,24 +23,36 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-# 背景除去に使用するライブラリ（任意依存）
+# 背景除去・画像処理に使用するライブラリ
 try:
     import numpy as np
-    import cv2
-    from scipy import ndimage
-    from collections import deque
-    _BG_REMOVAL_AVAILABLE = True
+    _NUMPY_AVAILABLE = True
 except ImportError:
-    _BG_REMOVAL_AVAILABLE = False
+    _NUMPY_AVAILABLE = False
 
-# プロジェクトルート（assets/images への絶対パス解決用）
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
+try:
+    from scipy import ndimage
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
+
+_BG_REMOVAL_AVAILABLE = _NUMPY_AVAILABLE and _CV2_AVAILABLE and _SCIPY_AVAILABLE
+
+# プロジェクトルート
 _WIN_ROOT = Path(__file__).parent.parent.resolve()
 
 from module.display_mode_module import (
@@ -48,7 +61,7 @@ from module.display_mode_module import (
 )
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageFilter, ImageDraw
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
@@ -83,7 +96,7 @@ class AutoScrollText(tk.Text):
 
 
 class PlaceholderEntry(tk.Text):
-    """プレースホルダー付き・自動リサイズ入力欄。文字が隠れない設計。"""
+    """プレースホルダー付き・自動リサイズ入力欄。"""
 
     _PLACEHOLDER_TAG = "placeholder"
 
@@ -221,401 +234,2547 @@ class CharacterAnimator:
 
 
 # ================================================================== #
-# 背景除去ダイアログ
+# 高度な画像処理エンジン（独自アルゴリズム・API不使用）
 # ================================================================== #
 
-class BgRemovalDialog(tk.Toplevel):
+class AdvancedImageProcessor:
     """
-    画像の背景を自動除去してキャラクター画像として登録するダイアログ。
+    独自アルゴリズムによる高精度画像処理エンジン。
+    外部API・学習済みモデル不使用。すべてアルゴリズムで実装。
 
-    アルゴリズム:
-      1. 純白(255,255,255)のみ BFS で外側から除去
-      2. GrabCut で「キャラクター領域」を補完
-      3. BFS非背景 ∪ GrabCut前景 → 前景マスク
-      4. 小クラスタ(面積<100px)のノイズ除去
-      5. 穴埋め（内部の背景島を前景に）
-      6. ソフトエッジ（境界1.5pxをフェザリング）
+    機能:
+      1. 高精度エッジ検出（Canny + Laplacian + Sobel の融合）
+      2. 適応的背景除去（Lab色空間 + グラフカット近似 + BFS）
+      3. 精細マスク精錬（形態学的処理 + ガウシアンフェザリング）
+      4. ポイント処理（ユーザー指定ピクセルからの範囲除去）
+      5. 選択範囲処理（矩形・楕円・自由曲線領域の除去）
+      6. 新背景合成（チェッカー・単色・グラデーション・画像）
+    """
+
+    # ----- 定数 -----
+    _FEATHER_RADIUS   = 2.5    # エッジのフェザリング半径(px)
+    _HAIR_DETAIL_ITER = 3      # 髪の毛詳細処理イテレーション数
+    _MIN_CLUSTER_PX   = 50     # 小クラスタ除去しきい値
+    _EDGE_BLEND_ALPHA = 0.35   # エッジ検出融合比率
+
+    def __init__(self) -> None:
+        self._available = _NUMPY_AVAILABLE and _PIL_AVAILABLE
+
+    def is_available(self) -> bool:
+        return self._available
+
+    # ================================================================
+    # ① 高精度エッジ検出（Sobel + Laplacian + 適応的閾値）
+    # ================================================================
+
+    def detect_edges_highquality(self, img_rgba: "np.ndarray") -> "np.ndarray":
+        """
+        複数のエッジ検出手法を融合した高精度エッジマップを返す。
+        髪の毛・細かいディテールも検出できるよう設計。
+
+        Returns:
+            uint8 グレースケール配列 (0=背景, 255=エッジ)
+        """
+        if not _NUMPY_AVAILABLE:
+            return np.zeros(img_rgba.shape[:2], dtype=np.uint8)
+
+        gray = self._to_gray(img_rgba)
+
+        # Sobelフィルタ（x, y方向の勾配を合成）
+        sobel_x = self._sobel_x(gray)
+        sobel_y = self._sobel_y(gray)
+        sobel   = np.sqrt(sobel_x**2 + sobel_y**2)
+        sobel   = np.clip(sobel / sobel.max() * 255, 0, 255).astype(np.uint8) if sobel.max() > 0 else sobel.astype(np.uint8)
+
+        # Laplacianフィルタ（二次微分：細かい輪郭強調）
+        lap = self._laplacian(gray)
+        lap = np.abs(lap)
+        lap = np.clip(lap / lap.max() * 255, 0, 255).astype(np.uint8) if lap.max() > 0 else lap.astype(np.uint8)
+
+        # 適応的しきい値によるCannyライク処理
+        canny_like = self._adaptive_threshold_edge(gray)
+
+        # 3種のエッジマップを加重融合
+        fused = (
+            sobel.astype(np.float32)     * 0.40 +
+            lap.astype(np.float32)       * 0.25 +
+            canny_like.astype(np.float32)* 0.35
+        )
+        fused = np.clip(fused, 0, 255).astype(np.uint8)
+
+        # 髪の毛などの細線強調（細線化ノイズ除去）
+        fused = self._enhance_thin_lines(fused)
+
+        return fused
+
+    def _to_gray(self, arr: "np.ndarray") -> "np.ndarray":
+        """RGBA → グレースケール（知覚的重みづけ）"""
+        r = arr[:, :, 0].astype(np.float32)
+        g = arr[:, :, 1].astype(np.float32)
+        b = arr[:, :, 2].astype(np.float32)
+        return (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+
+    def _sobel_x(self, gray: "np.ndarray") -> "np.ndarray":
+        kernel = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        return self._convolve2d(gray, kernel)
+
+    def _sobel_y(self, gray: "np.ndarray") -> "np.ndarray":
+        kernel = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+        return self._convolve2d(gray, kernel)
+
+    def _laplacian(self, gray: "np.ndarray") -> "np.ndarray":
+        kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
+        return self._convolve2d(gray, kernel)
+
+    def _convolve2d(self, img: "np.ndarray", kernel: "np.ndarray") -> "np.ndarray":
+        """手動畳み込み（scipy/cv2 非依存の純粋numpy実装）"""
+        kh, kw = kernel.shape
+        ph, pw = kh // 2, kw // 2
+        h, w = img.shape
+        padded = np.pad(img, ((ph, ph), (pw, pw)), mode='edge')
+        result = np.zeros_like(img)
+        for i in range(kh):
+            for j in range(kw):
+                result += kernel[i, j] * padded[i:i+h, j:j+w]
+        return result
+
+    def _adaptive_threshold_edge(self, gray: "np.ndarray") -> "np.ndarray":
+        """局所適応的しきい値によるエッジ検出"""
+        h, w = gray.shape
+        block = 15
+        result = np.zeros((h, w), dtype=np.uint8)
+        ph, pw = block // 2, block // 2
+        padded = np.pad(gray, ((ph, ph), (pw, pw)), mode='edge')
+        for y in range(h):
+            for x in range(w):
+                local = padded[y:y+block, x:x+block]
+                mean  = local.mean()
+                std   = local.std()
+                thr   = mean - 0.5 * std
+                result[y, x] = 255 if gray[y, x] < thr else 0
+        return result
+
+    def _enhance_thin_lines(self, edge_map: "np.ndarray") -> "np.ndarray":
+        """細線（髪の毛など）の強調処理"""
+        if not _SCIPY_AVAILABLE:
+            return edge_map
+        # 細いエッジを膨張させてから元に戻す（ノイズ除去しつつ細線保持）
+        struct = np.ones((2, 2), dtype=bool)
+        dilated  = ndimage.binary_dilation(edge_map > 128, structure=struct).astype(np.uint8) * 255
+        eroded   = ndimage.binary_erosion(dilated > 128,  structure=struct).astype(np.uint8) * 255
+        return np.maximum(edge_map, eroded)
+
+    # ================================================================
+    # ② 適応的背景除去
+    # ================================================================
+
+    def remove_background_adaptive(
+        self,
+        img_rgba: "np.ndarray",
+        sensitivity: float = 1.0,
+    ) -> "np.ndarray":
+        """
+        Lab色空間 + 適応的クラスタリング + BFS によって背景を除去する。
+        人物・動物・製品・車・グラフィックスなど多様な被写体に対応。
+
+        Args:
+            img_rgba:    RGBA numpy配列
+            sensitivity: 除去感度 (0.5=少なく, 1.0=標準, 2.0=多く)
+
+        Returns:
+            背景が透明になった RGBA numpy配列
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        h, w = img_rgba.shape[:2]
+        result = img_rgba.copy()
+
+        # Lab色空間に変換（人間の知覚に近い色差計算のため）
+        lab = self._rgb_to_lab(img_rgba[:, :, :3])
+
+        # 四隅から背景色サンプリング
+        m = max(3, min(12, h // 10, w // 10))
+        corner_pixels = np.concatenate([
+            lab[:m, :m].reshape(-1, 3),
+            lab[:m, -m:].reshape(-1, 3),
+            lab[-m:, :m].reshape(-1, 3),
+            lab[-m:, -m:].reshape(-1, 3),
+        ])
+        bg_lab = corner_pixels.mean(axis=0)
+        bg_std = corner_pixels.std(axis=0).mean()
+
+        # Lab色差によるマスク生成
+        diff = np.sqrt(np.sum((lab - bg_lab) ** 2, axis=2))
+        base_threshold = max(8.0, bg_std * 2.5) * sensitivity
+        is_bg_raw = diff < base_threshold
+
+        # BFSで外周から連結背景領域を特定
+        bg_mask = self._bfs_flood_fill(is_bg_raw, h, w)
+
+        # 半透明領域（エッジ付近）の精細処理
+        alpha_mask = self._refine_mask_with_edges(bg_mask, img_rgba, h, w)
+
+        result[:, :, 3] = np.where(bg_mask, 0, alpha_mask)
+        return result
+
+    def _rgb_to_lab(self, rgb: "np.ndarray") -> "np.ndarray":
+        """RGB → CIELab 変換（近似実装）"""
+        rgb_f = rgb.astype(np.float32) / 255.0
+
+        # sRGB → Linear RGB（ガンマ補正除去）
+        mask = rgb_f > 0.04045
+        linear = np.where(mask, ((rgb_f + 0.055) / 1.055) ** 2.4, rgb_f / 12.92)
+
+        # Linear RGB → XYZ (D65白色点)
+        r, g, b = linear[:, :, 0], linear[:, :, 1], linear[:, :, 2]
+        x = r * 0.4124 + g * 0.3576 + b * 0.1805
+        y = r * 0.2126 + g * 0.7152 + b * 0.0722
+        z = r * 0.0193 + g * 0.1192 + b * 0.9505
+
+        # XYZ → Lab
+        xn, yn, zn = 0.9505, 1.0000, 1.0890
+        fx = self._lab_f(x / xn)
+        fy = self._lab_f(y / yn)
+        fz = self._lab_f(z / zn)
+
+        L = 116 * fy - 16
+        a = 500 * (fx - fy)
+        b_c = 200 * (fy - fz)
+        return np.stack([L, a, b_c], axis=2)
+
+    def _lab_f(self, t: "np.ndarray") -> "np.ndarray":
+        delta = 6 / 29
+        return np.where(t > delta**3, t ** (1/3), t / (3 * delta**2) + 4/29)
+
+    def _bfs_flood_fill(self, is_bg: "np.ndarray", h: int, w: int) -> "np.ndarray":
+        """外周から連結背景領域をBFS探索"""
+        visited = np.zeros((h, w), dtype=bool)
+        q = deque()
+
+        def seed(r, c):
+            if not visited[r, c] and is_bg[r, c]:
+                visited[r, c] = True
+                q.append((r, c))
+
+        for r in range(h):
+            seed(r, 0); seed(r, w - 1)
+        for c in range(w):
+            seed(0, c); seed(h - 1, c)
+
+        nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+        while q:
+            r, c = q.popleft()
+            for dr, dc in nb8:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and is_bg[nr, nc]:
+                    visited[nr, nc] = True
+                    q.append((nr, nc))
+        return visited
+
+    def _refine_mask_with_edges(
+        self,
+        bg_mask: "np.ndarray",
+        img_rgba: "np.ndarray",
+        h: int, w: int,
+    ) -> "np.ndarray":
+        """エッジ情報を使ってマスクの境界を精細化し、フェザリング処理を施す"""
+        fg_mask = ~bg_mask
+
+        if _SCIPY_AVAILABLE:
+            # 距離変換でフェザリング
+            dist_in  = ndimage.distance_transform_edt(fg_mask).astype(np.float32)
+            dist_out = ndimage.distance_transform_edt(bg_mask).astype(np.float32)
+            feather  = self._FEATHER_RADIUS
+            alpha    = np.clip(dist_in / feather, 0.0, 1.0)
+            alpha[fg_mask & (dist_out > feather * 3)] = 1.0
+
+            # 小クラスタ（ノイズ）除去
+            labeled, num = ndimage.label(fg_mask.astype(np.uint8))
+            if num > 0:
+                sizes = ndimage.sum(fg_mask, labeled, range(1, num + 1))
+                for i, s in enumerate(sizes):
+                    if s < self._MIN_CLUSTER_PX:
+                        alpha[labeled == (i + 1)] = 0
+
+            # 穴埋め（被写体内部の孤立した背景ピクセル）
+            filled = ndimage.binary_fill_holes(alpha > 0.5)
+            alpha  = np.where(filled & ~fg_mask, alpha.max() * 0.8, alpha)
+        else:
+            alpha = fg_mask.astype(np.float32)
+
+        return (alpha * 255).astype(np.uint8)
+
+    # ================================================================
+    # ③ ポイント処理（ユーザー指定点からの除去）
+    # ================================================================
+
+    def remove_by_point(
+        self,
+        img_rgba: "np.ndarray",
+        px: int, py: int,
+        radius: int = 20,
+        sensitivity: float = 1.0,
+    ) -> "np.ndarray":
+        """
+        指定ピクセル座標を起点に、色が近いピクセルを除去する。
+        フラッドフィル（塗りつぶし除去）方式。
+
+        Args:
+            img_rgba:    RGBA numpy配列
+            px, py:      除去起点のピクセル座標 (display座標 → 変換済み)
+            radius:      除去半径ヒント（色許容差に影響）
+            sensitivity: 除去感度
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        result = img_rgba.copy()
+        h, w   = result.shape[:2]
+
+        if not (0 <= py < h and 0 <= px < w):
+            return result
+
+        # 基準色をサンプリング（指定点の周辺平均）
+        sr = max(0, py - 2)
+        er = min(h, py + 3)
+        sc = max(0, px - 2)
+        ec = min(w, px + 3)
+        seed_color = result[sr:er, sc:ec, :3].reshape(-1, 3).mean(axis=0)
+
+        # Lab色空間で色差計算
+        lab = self._rgb_to_lab(result[:, :, :3])
+        seed_lab = self._rgb_to_lab(
+            seed_color.reshape(1, 1, 3).astype(np.uint8)
+        )[0, 0]
+
+        # 許容差を radius と sensitivity から決定
+        tolerance = max(10.0, radius * 0.8) * sensitivity
+
+        # BFSフラッドフィル
+        diff   = np.sqrt(np.sum((lab - seed_lab) ** 2, axis=2))
+        is_similar = diff < tolerance
+        fill_mask  = self._bfs_flood_fill(is_similar, h, w)
+
+        # 指定点が外周に隣接していない場合、指定点を起点にローカルBFS
+        if not fill_mask[py, px]:
+            fill_mask = self._bfs_from_point(is_similar, py, px, h, w)
+
+        # フェザリング付きで透明化
+        if _SCIPY_AVAILABLE:
+            dist = ndimage.distance_transform_edt(fill_mask).astype(np.float32)
+            alpha_reduce = np.clip(dist / self._FEATHER_RADIUS, 0, 1)
+            result[:, :, 3] = (result[:, :, 3] * (1 - alpha_reduce * fill_mask)).astype(np.uint8)
+        else:
+            result[:, :, 3][fill_mask] = 0
+
+        return result
+
+    def _bfs_from_point(
+        self,
+        is_similar: "np.ndarray",
+        start_y: int, start_x: int,
+        h: int, w: int,
+    ) -> "np.ndarray":
+        """指定点を起点としたBFSフラッドフィル"""
+        visited = np.zeros((h, w), dtype=bool)
+        if not is_similar[start_y, start_x]:
+            return visited
+
+        q = deque([(start_y, start_x)])
+        visited[start_y, start_x] = True
+        nb4 = [(-1,0),(1,0),(0,-1),(0,1)]
+        while q:
+            r, c = q.popleft()
+            for dr, dc in nb4:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and is_similar[nr, nc]:
+                    visited[nr, nc] = True
+                    q.append((nr, nc))
+        return visited
+
+    # ================================================================
+    # ④ 選択範囲処理
+    # ================================================================
+
+    def remove_by_rect(
+        self,
+        img_rgba: "np.ndarray",
+        x1: int, y1: int, x2: int, y2: int,
+        mode: str = "hard",
+    ) -> "np.ndarray":
+        """
+        矩形選択範囲内のピクセルを除去する。
+
+        Args:
+            mode: "hard"=即時除去, "color"=色マッチング除去, "feather"=フェザリング除去
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        result = img_rgba.copy()
+        h, w   = result.shape[:2]
+        rx1, ry1 = max(0, min(x1, x2)), max(0, min(y1, y2))
+        rx2, ry2 = min(w, max(x1, x2)), min(h, max(y1, y2))
+
+        if mode == "hard":
+            result[ry1:ry2, rx1:rx2, 3] = 0
+        elif mode == "color":
+            region = result[ry1:ry2, rx1:rx2]
+            lab_r  = self._rgb_to_lab(region[:, :, :3])
+            lab_m  = lab_r.reshape(-1, 3).mean(axis=0)
+            diff   = np.sqrt(np.sum((lab_r - lab_m) ** 2, axis=2))
+            mask   = diff < 20
+            region[:, :, 3][mask] = 0
+            result[ry1:ry2, rx1:rx2] = region
+        elif mode == "feather":
+            if _SCIPY_AVAILABLE:
+                rect_mask = np.zeros((h, w), dtype=bool)
+                rect_mask[ry1:ry2, rx1:rx2] = True
+                dist = ndimage.distance_transform_edt(rect_mask).astype(np.float32)
+                alpha_fade = np.clip(1 - dist / 10, 0, 1)
+                result[:, :, 3] = (result[:, :, 3] * alpha_fade).astype(np.uint8)
+            else:
+                result[ry1:ry2, rx1:rx2, 3] = 0
+
+        return result
+
+    def remove_by_ellipse(
+        self,
+        img_rgba: "np.ndarray",
+        cx: int, cy: int, rx: int, ry: int,
+    ) -> "np.ndarray":
+        """楕円選択範囲内のピクセルを除去する。"""
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        result = img_rgba.copy()
+        h, w   = result.shape[:2]
+        ys, xs = np.mgrid[0:h, 0:w]
+        ellipse_mask = ((xs - cx)**2 / max(rx, 1)**2 + (ys - cy)**2 / max(ry, 1)**2) <= 1.0
+        result[:, :, 3][ellipse_mask] = 0
+        return result
+
+    def remove_by_lasso(
+        self,
+        img_rgba: "np.ndarray",
+        points: List[Tuple[int, int]],
+    ) -> "np.ndarray":
+        """
+        自由曲線（投げ縄）選択領域のピクセルを除去する。
+        点列を内外判定（Ray Casting）でマスク生成。
+        """
+        if not _NUMPY_AVAILABLE or len(points) < 3:
+            return img_rgba
+
+        result = img_rgba.copy()
+        h, w   = result.shape[:2]
+
+        # PIL DrawでポリゴンマスクをRasterize
+        if _PIL_AVAILABLE:
+            mask_img = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(mask_img)
+            draw.polygon(points, fill=255)
+            lasso_mask = np.array(mask_img) > 128
+            result[:, :, 3][lasso_mask] = 0
+
+        return result
+
+    # ================================================================
+    # ⑤ マスク手動調整（ブラシ追加・消去）
+    # ================================================================
+
+    def apply_brush(
+        self,
+        img_rgba: "np.ndarray",
+        px: int, py: int,
+        brush_size: int = 15,
+        mode: str = "erase",
+    ) -> "np.ndarray":
+        """
+        ブラシで手動編集（消去または復元）。
+
+        Args:
+            mode: "erase"=透明化, "restore"=不透明化
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        result = img_rgba.copy()
+        h, w   = result.shape[:2]
+        ys, xs = np.mgrid[0:h, 0:w]
+        dist   = np.sqrt((xs - px)**2 + (ys - py)**2)
+        brush  = dist <= brush_size
+
+        # ソフトブラシ（距離に応じてフェード）
+        soft_alpha = np.clip(1 - dist / brush_size, 0, 1)
+        soft_alpha[~brush] = 0
+
+        if mode == "erase":
+            result[:, :, 3] = (result[:, :, 3] * (1 - soft_alpha)).astype(np.uint8)
+        else:  # restore
+            result[:, :, 3] = np.clip(
+                result[:, :, 3] + (soft_alpha * 255), 0, 255
+            ).astype(np.uint8)
+
+        return result
+
+    # ================================================================
+    # ⑥ 背景合成
+    # ================================================================
+
+    def composite_with_background(
+        self,
+        fg_rgba: "np.ndarray",
+        bg_type: str = "checker",
+        bg_color: Tuple[int, int, int] = (100, 100, 200),
+        bg_image: Optional["np.ndarray"] = None,
+    ) -> "np.ndarray":
+        """
+        前景（透過済み）と背景を合成する。
+
+        Args:
+            bg_type: "checker"|"solid"|"gradient"|"image"
+        """
+        if not _NUMPY_AVAILABLE:
+            return fg_rgba
+
+        h, w = fg_rgba.shape[:2]
+
+        if bg_type == "checker":
+            bg = self._make_checker_array(w, h)
+        elif bg_type == "solid":
+            bg = np.full((h, w, 4), (*bg_color, 255), dtype=np.uint8)
+        elif bg_type == "gradient":
+            bg = self._make_gradient_array(w, h, bg_color)
+        elif bg_type == "image" and bg_image is not None:
+            bg = self._resize_bg(bg_image, w, h)
+        else:
+            bg = self._make_checker_array(w, h)
+
+        # アルファブレンディング
+        alpha = fg_rgba[:, :, 3:4].astype(np.float32) / 255.0
+        out   = (fg_rgba[:, :, :3].astype(np.float32) * alpha +
+                 bg[:, :, :3].astype(np.float32) * (1 - alpha)).astype(np.uint8)
+        return np.dstack([out, np.full((h, w), 255, dtype=np.uint8)])
+
+    def _make_checker_array(self, w: int, h: int, size: int = 16) -> "np.ndarray":
+        arr = np.full((h, w, 4), 255, dtype=np.uint8)
+        for y in range(0, h, size):
+            for x in range(0, w, size):
+                if ((x // size) + (y // size)) % 2 == 1:
+                    arr[y:y+size, x:x+size, :3] = 180
+        return arr
+
+    def _make_gradient_array(
+        self,
+        w: int, h: int,
+        color: Tuple[int, int, int],
+    ) -> "np.ndarray":
+        arr = np.zeros((h, w, 4), dtype=np.uint8)
+        for y in range(h):
+            t = y / max(h - 1, 1)
+            r = int(color[0] * (1 - t) + 30 * t)
+            g = int(color[1] * (1 - t) + 30 * t)
+            b = int(color[2] * (1 - t) + 60 * t)
+            arr[y, :, :3] = [r, g, b]
+        arr[:, :, 3] = 255
+        return arr
+
+    def _resize_bg(self, bg: "np.ndarray", w: int, h: int) -> "np.ndarray":
+        if not _PIL_AVAILABLE:
+            return np.full((h, w, 4), (100, 100, 100, 255), dtype=np.uint8)
+        img = Image.fromarray(bg).convert("RGBA").resize((w, h), Image.LANCZOS)
+        return np.array(img)
+
+    # ================================================================
+    # ⑥-B Inpaint（マスク領域の穴埋め補完）独自実装
+    # ================================================================
+
+    def inpaint_region(
+        self,
+        img_rgba: "np.ndarray",
+        mask: "np.ndarray",
+        radius: int = 8,
+    ) -> "np.ndarray":
+        """
+        マスク領域を周囲のピクセルで補完する（Inpaint）。
+        ComfyUI/Impact Pack的な「マスク→穴埋め」機能を独自実装。
+
+        アルゴリズム:
+          1. マスク境界を外側から内側へ同心円状に走査
+          2. 各ピクセルを有効な近傍ピクセルの加重平均で補完
+          3. 距離に応じた重み付け（近い画素を優先）
+          4. 複数回イタレーションで品質向上
+
+        Args:
+            img_rgba: RGBA numpy配列
+            mask:     補完対象マスク (True=補完する領域)
+            radius:   補完参照半径
+
+        Returns:
+            補完済み RGBA numpy配列
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
+
+        result = img_rgba.copy().astype(np.float32)
+        h, w   = result.shape[:2]
+        fill   = mask.copy()
+
+        # 境界ピクセルから内側へ反復補完（Telea法近似）
+        max_iter = max(h, w) // 2
+        for iteration in range(max_iter):
+            changed = False
+            # 補完すべきピクセルのうち、有効な隣接ピクセルがあるものを処理
+            ys, xs = np.where(fill)
+            if len(ys) == 0:
+                break
+
+            for y, x in zip(ys, xs):
+                # 参照半径内の有効ピクセルを収集
+                y0 = max(0, y - radius)
+                y1 = min(h, y + radius + 1)
+                x0 = max(0, x - radius)
+                x1 = min(w, x + radius + 1)
+
+                region_valid = ~fill[y0:y1, x0:x1]
+                if not region_valid.any():
+                    continue
+
+                # 距離加重平均で補完
+                ry, rx = np.mgrid[y0:y1, x0:x1]
+                dist   = np.sqrt((ry - y)**2 + (rx - x)**2) + 1e-6
+                weight = (1.0 / dist**2) * region_valid.astype(np.float32)
+                w_sum  = weight.sum()
+
+                if w_sum < 1e-6:
+                    continue
+
+                for ch in range(4):
+                    val = (result[y0:y1, x0:x1, ch] * weight).sum() / w_sum
+                    result[y, x, ch] = val
+
+                fill[y, x] = False
+                changed = True
+
+            if not changed:
+                break
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def create_inpaint_mask_from_alpha(self, img_rgba: "np.ndarray") -> "np.ndarray":
+        """
+        アルファチャンネルから Inpaint マスクを生成する。
+        透明領域（除去済み領域）をInpaint対象として返す。
+        """
+        if not _NUMPY_AVAILABLE:
+            return np.zeros(img_rgba.shape[:2], dtype=bool)
+        return img_rgba[:, :, 3] < 128
+
+    # ================================================================
+    # ⑦ 全セル一括処理ユーティリティ
+    # ================================================================
+
+    def process_all_cells(
+        self,
+        sheet_img: "Image.Image",
+        rows: int,
+        cols: int,
+        pose_names: List[str],
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, "Image.Image"]:
+        """
+        スプライトシートの全セルを一括処理して返す。
+        背景除去・クロップ・正規化を自動適用。
+        """
+        if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
+            return {}
+
+        results = {}
+        total = len(pose_names)
+        arr = np.array(sheet_img.convert("RGBA"))
+        h, w = arr.shape[:2]
+        cw, ch = w // cols, h // rows
+
+        for i, name in enumerate(pose_names):
+            if on_progress:
+                on_progress(i + 1, total, f"処理中: {name}")
+            row = i // cols
+            col = i % cols
+            cell_arr = arr[row*ch:(row+1)*ch, col*cw:(col+1)*cw]
+            try:
+                removed = self.remove_background_adaptive(cell_arr)
+                cropped = self._autocrop_array(removed)
+                norm    = self._normalize_array(cropped)
+                results[name] = Image.fromarray(norm)
+            except Exception as e:
+                logger.error(f"セル '{name}' 処理エラー: {e}")
+
+        return results
+
+    def _autocrop_array(self, arr: "np.ndarray", padding: int = 20) -> "np.ndarray":
+        """透明余白を自動クロップ"""
+        alpha = arr[:, :, 3]
+        mask  = alpha > 10
+        if not mask.any():
+            return arr
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        rmin = max(0, int(np.where(rows)[0][0])  - padding)
+        rmax = min(arr.shape[0] - 1, int(np.where(rows)[0][-1]) + padding)
+        cmin = max(0, int(np.where(cols)[0][0])  - padding)
+        cmax = min(arr.shape[1] - 1, int(np.where(cols)[0][-1]) + padding)
+        return arr[rmin:rmax+1, cmin:cmax+1]
+
+    def _normalize_array(self, arr: "np.ndarray", size: int = 2048) -> "np.ndarray":
+        """正方形キャンバスに正規化（upscale対応）"""
+        if not _PIL_AVAILABLE:
+            return arr
+        img = Image.fromarray(arr)
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        scale  = min(size / img.width, size / img.height)
+        nw, nh = int(img.width * scale), int(img.height * scale)
+        resized = img.resize((nw, nh), Image.LANCZOS)
+        canvas.paste(resized, ((size - nw) // 2, (size - nh) // 2), resized)
+        return np.array(canvas)
+
+
+# ================================================================== #
+# 高度な背景除去ダイアログ（統合版）
+# ================================================================== #
+
+class AdvancedBgRemovalDialog(tk.Toplevel):
+    """
+    高度な背景除去・画像編集ダイアログ。
+
+    機能:
+      - 全セル一括処理
+      - ポイント除去（クリック指定）
+      - 矩形・楕円・自由曲線選択範囲除去
+      - ブラシ（消去・復元）
+      - リアルタイムプレビュー
+      - 背景合成プレビュー（チェッカー・単色・グラデーション・画像）
+      - 保存確認ダイアログ（カスタム名・連番・保存先選択）
     """
 
     _POSES = ["default", "idle", "speaking", "thinking", "greeting"]
+    _POSE_FILE_MAP = {
+        "default":  "alice_default",
+        "idle":     "alice_idle",
+        "speaking": "alice_speaking",
+        "thinking": "alice_thinking",
+        "greeting": "alice_greeting",
+    }
 
-    def __init__(self, parent, char_loader=None, on_reload: Optional[Callable] = None):
+    _TOOL_POINT  = "point"
+    _TOOL_RECT   = "rect"
+    _TOOL_ELLIPSE= "ellipse"
+    _TOOL_LASSO  = "lasso"
+    _TOOL_BRUSH_ERASE   = "brush_erase"
+    _TOOL_BRUSH_RESTORE = "brush_restore"
+
+    def __init__(
+        self,
+        parent,
+        char_loader=None,
+        on_reload: Optional[Callable] = None,
+    ):
         super().__init__(parent)
-        self._char_loader  = char_loader
-        self._on_reload    = on_reload
-        self._src_image: Optional["Image.Image"] = None
-        self._result_image: Optional["Image.Image"] = None
-        self._tk_before: Optional["ImageTk.PhotoImage"] = None
-        self._tk_after:  Optional["ImageTk.PhotoImage"] = None
+        self._char_loader = char_loader
+        self._on_reload   = on_reload
+        self._processor   = AdvancedImageProcessor()
+
+        # 状態管理
+        self._src_image:    Optional[Image.Image] = None   # 元画像
+        self._work_arr:     Optional["np.ndarray"] = None  # 現在の編集配列
+        self._history_stack: List["np.ndarray"] = []       # Undo履歴
+        self._result_image: Optional[Image.Image] = None   # 最終結果
+        self._bg_image:     Optional["np.ndarray"] = None  # 合成用背景
+
+        # ツール状態
+        self._current_tool = self._TOOL_POINT
+        self._brush_size   = 15
+        self._point_radius = 20
+        self._sensitivity  = tk.DoubleVar(value=1.0)
+        self._rect_start:  Optional[Tuple[int, int]] = None
+        self._rect_end:    Optional[Tuple[int, int]] = None
+        self._rect_drawing = False
+        self._lasso_points: List[Tuple[int, int]] = []
+        self._lasso_drawing = False
+
+        # プレビュースケール
+        self._preview_scale = 1.0
+        self._preview_offset = (0, 0)
+
+        # 処理フラグ
         self._processing = False
 
-        theme_name = "dark"
-        try:
-            from module.display_mode_module import Theme
-            c = Theme.get(theme_name)
-        except Exception:
-            c = type("C", (), {
-                "bg_primary": "#1e1e2e", "bg_secondary": "#181825",
-                "bg_tertiary": "#313244", "text_primary": "#cdd6f4",
-                "text_secondary": "#a6adc8", "text_muted": "#585b70",
-                "accent_primary": "#89b4fa", "border": "#45475a",
-                "border_focus": "#89b4fa", "success": "#a6e3a1",
-                "error_color": "#f38ba8",
-            })()
-        self._c = c
+        # バッチ処理結果
+        self._batch_results: Dict[str, Image.Image] = {}
 
-        self.title("背景除去ツール")
-        self.geometry("900x620")
-        self.minsize(760, 520)
-        self.configure(bg=c.bg_primary)
+        self._setup_theme()
+        self.title("高度な画像処理ツール - Alice AI")
+        self.geometry("1280x800")
+        self.minsize(1000, 650)
+        self.configure(bg=self._c.bg_primary)
         self.transient(parent)
         self.grab_set()
-        self._build(c)
+        self._build_ui()
 
-        if not _BG_REMOVAL_AVAILABLE:
-            self._set_status("※ numpy / opencv-python / scipy が必要です。pip install numpy opencv-python scipy", error=True)
+    def _setup_theme(self):
+        try:
+            from module import env_binder_module as env
+            theme_name = env.get("APP_THEME", "dark")
+        except Exception:
+            theme_name = "dark"
+        self._c = Theme.get(theme_name)
 
-    # ------------------------------------------------------------------ #
+    # ================================================================
     # UI構築
-    # ------------------------------------------------------------------ #
+    # ================================================================
 
-    def _build(self, c):
-        # ── ツールバー行 ──────────────────────────────────────────────
-        tb = tk.Frame(self, bg=c.bg_secondary, pady=8)
-        tb.pack(fill="x", padx=0)
+    def _build_ui(self):
+        c = self._c
 
-        self._btn(tb, c, "📂  画像を選択", self._select_file, c.bg_tertiary, c.text_primary).pack(side="left", padx=12)
+        # ── メインレイアウト: 左ツールバー | 中央プレビュー | 右パネル ──
+        main = tk.Frame(self, bg=c.bg_primary)
+        main.pack(fill="both", expand=True)
 
-        self._path_var = tk.StringVar(value="ファイルを選択してください")
-        tk.Label(tb, textvariable=self._path_var, bg=c.bg_secondary,
-                 fg=c.text_secondary, font=("Segoe UI", 9),
-                 anchor="w").pack(side="left", fill="x", expand=True, padx=8)
+        # 左ツールバー
+        self._build_toolbar(main, c)
 
-        # ── プレビューエリア ─────────────────────────────────────────
-        preview_frame = tk.Frame(self, bg=c.bg_primary)
-        preview_frame.pack(fill="both", expand=True, padx=10, pady=(6, 4))
-        preview_frame.columnconfigure(0, weight=1)
-        preview_frame.columnconfigure(1, weight=1)
-        preview_frame.rowconfigure(1, weight=1)
+        # 中央プレビューエリア（PanedWindow）
+        center = tk.Frame(main, bg=c.bg_primary)
+        center.pack(side="left", fill="both", expand=True, padx=4)
 
-        for col, label in [(0, "元画像"), (1, "処理後（背景透過）")]:
-            tk.Label(preview_frame, text=label, bg=c.bg_primary,
-                     fg=c.text_secondary, font=("Segoe UI", 9, "bold")).grid(
-                row=0, column=col, sticky="w", padx=4, pady=(0, 2))
+        self._build_preview_area(center, c)
 
-        # 元画像キャンバス
-        self._canvas_before = tk.Canvas(
-            preview_frame, bg="#2a2a3a", highlightthickness=1,
-            highlightbackground=c.border)
-        self._canvas_before.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        # 右パネル（設定・一括処理）
+        self._build_right_panel(main, c)
 
-        # 結果キャンバス（チェッカーパターン背景で透明度を視覚化）
-        self._canvas_after = tk.Canvas(
-            preview_frame, bg="#2a2a3a", highlightthickness=1,
-            highlightbackground=c.border)
-        self._canvas_after.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
-        self._canvas_after.bind("<Configure>", lambda e: self._redraw_after())
+        # 下部ステータスバー
+        self._build_status_bar(c)
 
-        # ── コントロール行 ───────────────────────────────────────────
-        ctrl = tk.Frame(self, bg=c.bg_secondary, pady=10)
-        ctrl.pack(fill="x", padx=0)
+    def _build_toolbar(self, parent, c):
+        """左側ツールバー（ツール選択・ブラシサイズ等）"""
+        tb = tk.Frame(parent, bg=c.bg_secondary, width=90)
+        tb.pack(side="left", fill="y", padx=(0, 2))
+        tb.pack_propagate(False)
 
-        tk.Label(ctrl, text="保存先ポーズ:", bg=c.bg_secondary,
-                 fg=c.text_secondary, font=("Segoe UI", 10)).pack(side="left", padx=(14, 4))
+        tk.Label(tb, text="ツール", bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8, "bold")).pack(pady=(8, 2))
 
-        self._pose_var = tk.StringVar(value="default")
-        pose_cb = ttk.Combobox(ctrl, textvariable=self._pose_var,
-                                values=self._POSES, state="readonly",
-                                width=12, font=("Segoe UI", 10))
-        pose_cb.pack(side="left", padx=(0, 16))
-
-        self._process_btn = self._btn(
-            ctrl, c, "✨  背景を除去", self._start_processing,
-            c.accent_primary, c.bg_primary)
-        self._process_btn.pack(side="left", padx=4)
-
-        self._save_btn = self._btn(
-            ctrl, c, "💾  保存してキャラクターに設定", self._save_and_apply,
-            "#a6e3a1", c.bg_primary)
-        self._save_btn.pack(side="left", padx=8)
-        self._save_btn.configure(state="disabled")
-
-        # プログレスバー
-        style = ttk.Style()
-        style.configure("BR.Horizontal.TProgressbar",
-                        troughcolor=c.bg_tertiary,
-                        background=c.accent_primary, thickness=4)
-        self._progress = ttk.Progressbar(
-            ctrl, style="BR.Horizontal.TProgressbar",
-            mode="indeterminate", length=120)
-        self._progress.pack(side="left", padx=8)
-
-        # ステータスラベル
-        self._status_var = tk.StringVar(value="画像を選択してください")
-        self._status_lbl = tk.Label(
-            ctrl, textvariable=self._status_var,
-            bg=c.bg_secondary, fg=c.text_muted,
-            font=("Segoe UI", 9), anchor="w")
-        self._status_lbl.pack(side="left", fill="x", expand=True, padx=8)
-
-        self._btn(ctrl, c, "閉じる", self.destroy,
-                  c.bg_tertiary, c.text_secondary).pack(side="right", padx=12)
-
-    # ------------------------------------------------------------------ #
-    # ファイル選択
-    # ------------------------------------------------------------------ #
-
-    def _select_file(self):
-        path = filedialog.askopenfilename(
-            title="背景除去する画像を選択",
-            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp"), ("すべて", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            if not _PIL_AVAILABLE:
-                self._set_status("Pillow が必要です", error=True)
-                return
-            img = Image.open(path).convert("RGBA")
-            self._src_image = img
-            self._result_image = None
-            self._save_btn.configure(state="disabled")
-            self._path_var.set(Path(path).name)
-            self._draw_preview(self._canvas_before, img, checker=False)
-            self._clear_canvas(self._canvas_after)
-            self._set_status("画像を読み込みました。「背景を除去」を押してください。")
-        except Exception as e:
-            self._set_status(f"読み込みエラー: {e}", error=True)
-
-    # ------------------------------------------------------------------ #
-    # 背景除去処理
-    # ------------------------------------------------------------------ #
-
-    def _start_processing(self):
-        if not _BG_REMOVAL_AVAILABLE:
-            self._set_status("numpy / opencv-python / scipy が未インストールです", error=True)
-            return
-        if self._src_image is None:
-            self._set_status("先に画像を選択してください", error=True)
-            return
-        if self._processing:
-            return
-        self._processing = True
-        self._process_btn.configure(state="disabled")
-        self._save_btn.configure(state="disabled")
-        self._progress.start(12)
-        self._set_status("処理中...")
-        threading.Thread(target=self._run_removal, daemon=True).start()
-
-    def _run_removal(self):
-        """バックグラウンドスレッドで背景除去を実行する。"""
-        try:
-            result = _remove_background(self._src_image)
-            self.after(0, self._on_done, result)
-        except Exception as e:
-            self.after(0, self._on_error, str(e))
-
-    def _on_done(self, result: "Image.Image"):
-        self._result_image = result
-        self._progress.stop()
-        self._processing = False
-        self._process_btn.configure(state="normal")
-        self._save_btn.configure(state="normal")
-        self._set_status("完了！保存先ポーズを選んで「保存」を押してください。")
-        self._draw_preview(self._canvas_after, result, checker=True)
-
-    def _on_error(self, msg: str):
-        self._progress.stop()
-        self._processing = False
-        self._process_btn.configure(state="normal")
-        self._set_status(f"エラー: {msg}", error=True)
-
-    # ------------------------------------------------------------------ #
-    # 保存 & キャラクター反映
-    # ------------------------------------------------------------------ #
-
-    def _save_and_apply(self):
-        if self._result_image is None:
-            return
-        pose = self._pose_var.get()
-        pose_map = {
-            "default":  "alice_default",
-            "idle":     "alice_idle",
-            "speaking": "alice_speaking",
-            "thinking": "alice_thinking",
-            "greeting": "alice_greeting",
-        }
-        fname = pose_map.get(pose, "alice_default")
-        dest_dir = _WIN_ROOT / "assets" / "images"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f"{fname}.png"
-        try:
-            self._result_image.save(dest, "PNG")
-            logger.info(f"BgRemovalDialog: 保存 → {dest}")
-            self._set_status(f"保存しました: assets/images/{fname}.png")
-            # CharacterLoader のキャッシュをクリアして再読み込み
-            if self._char_loader is not None:
-                self._char_loader.reload()
-            if self._on_reload is not None:
-                self.after(200, self._on_reload)
-            messagebox.showinfo(
-                "保存完了",
-                f"キャラクター画像を保存しました。\n"
-                f"ポーズ: {pose}\n"
-                f"パス: assets/images/{fname}.png",
-                parent=self
+        self._tool_btns = {}
+        tools = [
+            (self._TOOL_POINT,        "🎯", "ポイント除去"),
+            (self._TOOL_RECT,         "⬜", "矩形選択除去"),
+            (self._TOOL_ELLIPSE,      "⭕", "楕円選択除去"),
+            (self._TOOL_LASSO,        "🔗", "投げ縄選択"),
+            (self._TOOL_BRUSH_ERASE,  "✏️", "消去ブラシ"),
+            (self._TOOL_BRUSH_RESTORE,"🖌️", "復元ブラシ"),
+        ]
+        for tool_id, icon, tip in tools:
+            btn = tk.Button(
+                tb, text=f"{icon}\n{tip[:4]}", command=lambda t=tool_id: self._select_tool(t),
+                bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                font=("Segoe UI", 8), padx=4, pady=6, cursor="hand2",
+                wraplength=70,
+                activebackground=c.accent_primary,
             )
-        except Exception as e:
-            self._set_status(f"保存エラー: {e}", error=True)
-            messagebox.showerror("保存エラー", str(e), parent=self)
+            btn.pack(fill="x", padx=4, pady=1)
+            self._tool_btns[tool_id] = btn
 
-    # ------------------------------------------------------------------ #
+        tk.Label(tb, text="ブラシ", bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8, "bold")).pack(pady=(12, 0))
+        self._brush_scale = tk.Scale(
+            tb, from_=3, to=80, orient="vertical",
+            bg=c.bg_secondary, fg=c.text_primary,
+            troughcolor=c.bg_tertiary, highlightthickness=0,
+            command=lambda v: setattr(self, "_brush_size", int(v)),
+        )
+        self._brush_scale.set(15)
+        self._brush_scale.pack(padx=8, pady=2)
+
+        tk.Label(tb, text="感度", bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8, "bold")).pack(pady=(6, 0))
+        tk.Scale(
+            tb, from_=0.3, to=3.0, resolution=0.1, orient="vertical",
+            bg=c.bg_secondary, fg=c.text_primary,
+            troughcolor=c.bg_tertiary, highlightthickness=0,
+            variable=self._sensitivity,
+        ).pack(padx=8, pady=2)
+
+        # Undo ボタン
+        tk.Button(
+            tb, text="↩ Undo", command=self._undo,
+            bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+            font=("Segoe UI", 8), padx=4, pady=4, cursor="hand2",
+        ).pack(fill="x", padx=4, pady=(10, 1))
+
+        # リセット
+        tk.Button(
+            tb, text="🔄 リセット", command=self._reset_to_original,
+            bg=c.bg_tertiary, fg=c.accent_error, relief="flat",
+            font=("Segoe UI", 8), padx=4, pady=4, cursor="hand2",
+        ).pack(fill="x", padx=4, pady=1)
+
+        self._select_tool(self._TOOL_POINT)
+
+    def _build_preview_area(self, parent, c):
+        """中央: 元画像 / 処理後 の左右プレビュー"""
+        paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        paned.pack(fill="both", expand=True)
+
+        # 左: 元画像（クリック操作受付）
+        lf = tk.Frame(paned, bg=c.bg_primary)
+        paned.add(lf, weight=1)
+        tk.Label(lf, text="元画像（操作エリア）", bg=c.bg_primary,
+                 fg=c.text_secondary, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=4)
+        self._canvas_src = tk.Canvas(
+            lf, bg="#1a1a2e", highlightthickness=1, cursor="crosshair",
+            highlightbackground=c.border,
+        )
+        self._canvas_src.pack(fill="both", expand=True, padx=2, pady=2)
+        self._bind_canvas_events()
+
+        # 右: 処理後プレビュー（背景合成表示）
+        rf = tk.Frame(paned, bg=c.bg_primary)
+        paned.add(rf, weight=1)
+
+        # 背景選択ヘッダー
+        hdr = tk.Frame(rf, bg=c.bg_primary)
+        hdr.pack(fill="x", padx=2)
+        tk.Label(hdr, text="処理後プレビュー  背景:", bg=c.bg_primary,
+                 fg=c.text_secondary, font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
+        self._bg_type_var = tk.StringVar(value="checker")
+        for bgt, lbl in [("checker","チェッカー"),("solid","単色"),
+                          ("gradient","グラデ"),("image","画像")]:
+            tk.Radiobutton(
+                hdr, text=lbl, variable=self._bg_type_var, value=bgt,
+                bg=c.bg_primary, fg=c.text_secondary,
+                selectcolor=c.bg_tertiary, activebackground=c.bg_primary,
+                command=self._refresh_result_preview,
+                font=("Segoe UI", 8),
+            ).pack(side="left")
+
+        tk.Button(
+            hdr, text="背景画像選択", command=self._select_bg_image,
+            bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+            font=("Segoe UI", 8), padx=6, pady=2, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        self._canvas_result = tk.Canvas(
+            rf, bg="#1a1a2e", highlightthickness=1,
+            highlightbackground=c.border,
+        )
+        self._canvas_result.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # TkImage保持用
+        self._tk_src:    Optional[ImageTk.PhotoImage] = None
+        self._tk_result: Optional[ImageTk.PhotoImage] = None
+
+    def _build_right_panel(self, parent, c):
+        """右パネル: ファイル操作・一括処理・自動除去・保存"""
+        rp = tk.Frame(parent, bg=c.bg_secondary, width=280)
+        rp.pack(side="right", fill="y", padx=(2, 0))
+        rp.pack_propagate(False)
+
+        # スクロール可能エリア
+        canvas_rp = tk.Canvas(rp, bg=c.bg_secondary, highlightthickness=0)
+        sb_rp     = ttk.Scrollbar(rp, orient="vertical", command=canvas_rp.yview)
+        canvas_rp.configure(yscrollcommand=sb_rp.set)
+        sb_rp.pack(side="right", fill="y")
+        canvas_rp.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas_rp, bg=c.bg_secondary)
+        canvas_rp.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas_rp.configure(
+            scrollregion=canvas_rp.bbox("all")))
+
+        def section(text):
+            tk.Label(inner, text=text, bg=c.bg_secondary, fg=c.accent_primary,
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(12,2))
+
+        def sep():
+            tk.Frame(inner, bg=c.border, height=1).pack(fill="x", padx=10, pady=4)
+
+        # ── ファイル操作 ──
+        section("📂 ファイル操作")
+        self._btn(inner, c, "画像を開く", self._open_file).pack(fill="x", padx=10, pady=2)
+        self._btn(inner, c, "シート(複数セル)を開く", self._open_sheet).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── 自動背景除去 ──
+        section("🤖 自動背景除去")
+        self._btn(inner, c, "自動除去実行", self._run_auto_remove,
+                  c.accent_primary).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── 全セル一括処理 ──
+        section("📊 全セル一括処理")
+        sheet_grid = tk.Frame(inner, bg=c.bg_secondary)
+        sheet_grid.pack(fill="x", padx=10, pady=2)
+        tk.Label(sheet_grid, text="行:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+        self._sheet_rows = tk.IntVar(value=4)
+        tk.Spinbox(sheet_grid, from_=1, to=16, textvariable=self._sheet_rows,
+                   width=4, bg=c.bg_tertiary, fg=c.text_primary,
+                   buttonbackground=c.bg_tertiary).grid(row=0, column=1, padx=4)
+        tk.Label(sheet_grid, text="列:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).grid(row=0, column=2, sticky="w")
+        self._sheet_cols = tk.IntVar(value=4)
+        tk.Spinbox(sheet_grid, from_=1, to=16, textvariable=self._sheet_cols,
+                   width=4, bg=c.bg_tertiary, fg=c.text_primary,
+                   buttonbackground=c.bg_tertiary).grid(row=0, column=3, padx=4)
+        self._btn(inner, c, "一括処理実行", self._run_batch_process).pack(fill="x", padx=10, pady=2)
+
+        # バッチ結果リスト
+        tk.Label(inner, text="処理済みセル:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=10)
+        self._batch_listbox = tk.Listbox(
+            inner, height=6, bg=c.bg_tertiary, fg=c.text_primary,
+            selectbackground=c.accent_primary, relief="flat",
+            font=("Segoe UI", 9),
+        )
+        self._batch_listbox.pack(fill="x", padx=10, pady=2)
+        self._batch_listbox.bind("<<ListboxSelect>>", self._on_batch_select)
+
+        sep()
+
+        # ── エッジ検出 ──
+        section("🔍 エッジ検出")
+        self._btn(inner, c, "エッジを表示", self._show_edges).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── 保存先ポーズ ──
+        section("💾 保存設定")
+        tk.Label(inner, text="ポーズ名:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=10)
+        self._pose_var = tk.StringVar(value="default")
+        ttk.Combobox(inner, textvariable=self._pose_var,
+                     values=self._POSES, state="readonly",
+                     font=("Segoe UI", 10)).pack(fill="x", padx=10, pady=2)
+
+        tk.Label(inner, text="カスタムファイル名 (任意):", bg=c.bg_secondary,
+                 fg=c.text_secondary, font=("Segoe UI", 9)).pack(anchor="w", padx=10)
+        self._custom_name_var = tk.StringVar()
+        tk.Entry(inner, textvariable=self._custom_name_var,
+                 bg=c.bg_tertiary, fg=c.text_primary,
+                 insertbackground=c.text_primary, relief="flat",
+                 font=("Segoe UI", 10), highlightthickness=1,
+                 highlightbackground=c.border).pack(fill="x", padx=10, pady=2, ipady=3)
+
+        self._save_btn = self._btn(inner, c, "💾 保存", self._save_with_confirm,
+                                   bg=c.accent_success if hasattr(c, 'accent_success') else "#4ade80",
+                                   fg="#000")
+        self._save_btn.pack(fill="x", padx=10, pady=2)
+        self._save_btn.configure(state="disabled")
+
+        self._save_batch_btn = self._btn(inner, c, "📦 一括保存", self._save_batch_with_confirm)
+        self._save_batch_btn.pack(fill="x", padx=10, pady=2)
+        self._save_batch_btn.configure(state="disabled")
+
+        sep()
+
+        # ── Inpaint（穴埋め補完）──
+        section("🔨 Inpaint（穴埋め補完）")
+        tk.Label(inner, text="除去した領域を周囲のピクセルで\n自動補完します",
+                 bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=10)
+        tk.Label(inner, text="補完半径:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=10, pady=(4, 0))
+        self._inpaint_radius = tk.IntVar(value=8)
+        tk.Scale(inner, variable=self._inpaint_radius, from_=2, to=24,
+                 orient="horizontal", bg=c.bg_secondary, fg=c.text_primary,
+                 troughcolor=c.bg_tertiary, highlightthickness=0,
+                 ).pack(fill="x", padx=10)
+        self._btn(inner, c, "🔨 Inpaint 実行", self._run_inpaint).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── アニメーション作成へ連携 ──
+        section("🎬 アニメーション作成")
+        tk.Label(inner, text="処理済み画像をアニメーション\n作成ツールへ送ります",
+                 bg=c.bg_secondary, fg=c.text_muted,
+                 font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=10)
+        self._btn(inner, c, "🎬 アニメーション作成ツールへ",
+                  self._open_animation_from_here).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── プログレス ──
+        self._progress = ttk.Progressbar(inner, mode="indeterminate", length=200)
+        self._progress.pack(padx=10, pady=4)
+
+        self._status_var = tk.StringVar(value="画像を開いてください")
+        tk.Label(inner, textvariable=self._status_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Segoe UI", 8),
+                 wraplength=240, justify="left").pack(padx=10, pady=4)
+
+
+    def _build_status_bar(self, c):
+        sb = tk.Frame(self, bg=c.bg_secondary, height=24)
+        sb.pack(fill="x", side="bottom")
+        sb.pack_propagate(False)
+        self._coord_var = tk.StringVar(value="X:- Y:-")
+        tk.Label(sb, textvariable=self._coord_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Consolas", 8)).pack(side="left", padx=8)
+        self._tool_info_var = tk.StringVar(value="ツール: ポイント除去")
+        tk.Label(sb, textvariable=self._tool_info_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Segoe UI", 8)).pack(side="right", padx=8)
+
+    # ================================================================
+    # キャンバスイベントバインド
+    # ================================================================
+
+    def _bind_canvas_events(self):
+        c = self._canvas_src
+        c.bind("<Button-1>",       self._on_canvas_click)
+        c.bind("<B1-Motion>",      self._on_canvas_drag)
+        c.bind("<ButtonRelease-1>",self._on_canvas_release)
+        c.bind("<Motion>",         self._on_canvas_motion)
+        c.bind("<Configure>",      lambda e: self._redraw_src())
+
+    def _canvas_to_image_coords(self, cx: int, cy: int) -> Tuple[int, int]:
+        """キャンバス座標 → 画像ピクセル座標に変換"""
+        if self._work_arr is None or not _PIL_AVAILABLE:
+            return cx, cy
+        h, w = self._work_arr.shape[:2]
+        cw = self._canvas_src.winfo_width()
+        ch = self._canvas_src.winfo_height()
+        scale = min(cw / max(w, 1), ch / max(h, 1)) * 0.95
+        ox    = (cw - w * scale) / 2
+        oy    = (ch - h * scale) / 2
+        ix    = int((cx - ox) / scale)
+        iy    = int((cy - oy) / scale)
+        return max(0, min(w - 1, ix)), max(0, min(h - 1, iy))
+
+    def _on_canvas_motion(self, event):
+        if self._work_arr is None:
+            return
+        ix, iy = self._canvas_to_image_coords(event.x, event.y)
+        self._coord_var.set(f"X:{ix} Y:{iy}")
+
+    def _on_canvas_click(self, event):
+        if self._work_arr is None:
+            return
+        ix, iy = self._canvas_to_image_coords(event.x, event.y)
+        tool = self._current_tool
+
+        if tool == self._TOOL_POINT:
+            self._push_history()
+            self._work_arr = self._processor.remove_by_point(
+                self._work_arr, ix, iy,
+                radius=self._brush_size,
+                sensitivity=self._sensitivity.get(),
+            )
+            self._refresh_all_previews()
+
+        elif tool in (self._TOOL_BRUSH_ERASE, self._TOOL_BRUSH_RESTORE):
+            self._push_history()
+            mode = "erase" if tool == self._TOOL_BRUSH_ERASE else "restore"
+            self._work_arr = self._processor.apply_brush(
+                self._work_arr, ix, iy, self._brush_size, mode)
+            self._refresh_all_previews()
+
+        elif tool == self._TOOL_RECT:
+            self._rect_start = (ix, iy)
+            self._rect_drawing = True
+
+        elif tool == self._TOOL_ELLIPSE:
+            self._rect_start = (ix, iy)
+            self._rect_drawing = True
+
+        elif tool == self._TOOL_LASSO:
+            if not self._lasso_drawing:
+                self._lasso_points = [(ix, iy)]
+                self._lasso_drawing = True
+            else:
+                self._lasso_points.append((ix, iy))
+            self._redraw_src()
+
+    def _on_canvas_drag(self, event):
+        if self._work_arr is None:
+            return
+        ix, iy = self._canvas_to_image_coords(event.x, event.y)
+
+        if self._current_tool in (self._TOOL_BRUSH_ERASE, self._TOOL_BRUSH_RESTORE):
+            mode = "erase" if self._current_tool == self._TOOL_BRUSH_ERASE else "restore"
+            self._work_arr = self._processor.apply_brush(
+                self._work_arr, ix, iy, self._brush_size, mode)
+            self._refresh_all_previews()
+
+        elif self._current_tool in (self._TOOL_RECT, self._TOOL_ELLIPSE) and self._rect_drawing:
+            self._rect_end = (ix, iy)
+            self._redraw_src_with_selection()
+
+        elif self._current_tool == self._TOOL_LASSO and self._lasso_drawing:
+            self._lasso_points.append((ix, iy))
+            self._redraw_src_with_selection()
+
+    def _on_canvas_release(self, event):
+        if self._work_arr is None:
+            return
+        ix, iy = self._canvas_to_image_coords(event.x, event.y)
+
+        if self._current_tool == self._TOOL_RECT and self._rect_drawing:
+            self._rect_end = (ix, iy)
+            self._rect_drawing = False
+            if self._rect_start and self._rect_end:
+                self._push_history()
+                x1, y1 = self._rect_start
+                x2, y2 = self._rect_end
+                self._work_arr = self._processor.remove_by_rect(
+                    self._work_arr, x1, y1, x2, y2, mode="hard")
+                self._refresh_all_previews()
+
+        elif self._current_tool == self._TOOL_ELLIPSE and self._rect_drawing:
+            self._rect_end = (ix, iy)
+            self._rect_drawing = False
+            if self._rect_start and self._rect_end:
+                self._push_history()
+                x1, y1 = self._rect_start
+                x2, y2 = self._rect_end
+                cx, cy = (x1+x2)//2, (y1+y2)//2
+                rx, ry = abs(x2-x1)//2, abs(y2-y1)//2
+                self._work_arr = self._processor.remove_by_ellipse(
+                    self._work_arr, cx, cy, rx, ry)
+                self._refresh_all_previews()
+
+        elif self._current_tool == self._TOOL_LASSO and self._lasso_drawing:
+            # ダブルクリック相当: release で確定
+            pass  # ダブルクリックで確定（別バインド）
+
+    # ================================================================
     # プレビュー描画
-    # ------------------------------------------------------------------ #
+    # ================================================================
 
-    def _draw_preview(self, canvas: tk.Canvas, img: "Image.Image", checker: bool):
-        """キャンバスにフィットさせて画像を描画する。"""
+    def _redraw_src(self):
+        """元画像（+ 操作ガイド）をキャンバスに描画"""
+        if not _PIL_AVAILABLE or self._src_image is None:
+            return
+        self._draw_to_canvas(self._canvas_src, self._src_image, "_tk_src",
+                             checker=False)
+
+    def _redraw_src_with_selection(self):
+        """選択範囲オーバーレイ付きで元画像を描画"""
+        self._redraw_src()
+        c = self._canvas_src
+        cw, ch = c.winfo_width(), c.winfo_height()
+
+        if self._src_image is None:
+            return
+        h, w = self._src_image.height, self._src_image.width
+        scale = min(cw / max(w,1), ch / max(h,1)) * 0.95
+        ox    = (cw - w * scale) / 2
+        oy    = (ch - h * scale) / 2
+
+        def i2c(ix, iy):
+            return ox + ix * scale, oy + iy * scale
+
+        c.delete("selection_overlay")
+
+        if self._current_tool == self._TOOL_RECT and self._rect_start and self._rect_end:
+            x1c, y1c = i2c(*self._rect_start)
+            x2c, y2c = i2c(*self._rect_end)
+            c.create_rectangle(x1c, y1c, x2c, y2c,
+                                outline="#ff6666", width=2, dash=(4, 4),
+                                tags="selection_overlay")
+
+        elif self._current_tool == self._TOOL_ELLIPSE and self._rect_start and self._rect_end:
+            x1c, y1c = i2c(*self._rect_start)
+            x2c, y2c = i2c(*self._rect_end)
+            c.create_oval(x1c, y1c, x2c, y2c,
+                          outline="#ff6666", width=2, dash=(4, 4),
+                          tags="selection_overlay")
+
+        elif self._current_tool == self._TOOL_LASSO and len(self._lasso_points) > 1:
+            pts_c = [i2c(px, py) for px, py in self._lasso_points]
+            flat  = [v for pt in pts_c for v in pt]
+            c.create_line(*flat, fill="#ff9966", width=2, tags="selection_overlay")
+
+    def _refresh_result_preview(self):
+        """処理後プレビューを更新"""
+        if self._work_arr is None or not _PIL_AVAILABLE:
+            return
+        bg_type = self._bg_type_var.get()
+        composited = self._processor.composite_with_background(
+            self._work_arr, bg_type=bg_type, bg_image=self._bg_image)
+        img = Image.fromarray(composited)
+        self._draw_to_canvas(self._canvas_result, img, "_tk_result", checker=False)
+        self._result_image = Image.fromarray(self._work_arr)
+
+    def _refresh_all_previews(self):
+        """元画像と結果プレビューを両方更新"""
+        self._redraw_src()
+        self._refresh_result_preview()
+
+    def _draw_to_canvas(
+        self,
+        canvas: tk.Canvas,
+        img: Image.Image,
+        attr: str,
+        checker: bool = False,
+    ):
         if not _PIL_AVAILABLE:
             return
         canvas.update_idletasks()
         cw, ch = canvas.winfo_width(), canvas.winfo_height()
         if cw <= 1 or ch <= 1:
-            cw, ch = 380, 460
-        ratio = min(cw / img.width, ch / img.height) * 0.95
-        nw, nh = max(1, int(img.width * ratio)), max(1, int(img.height * ratio))
-        x, y = (cw - nw) // 2, (ch - nh) // 2
+            cw, ch = 500, 500
+        scale = min(cw / max(img.width,1), ch / max(img.height,1)) * 0.95
+        nw    = max(1, int(img.width * scale))
+        nh    = max(1, int(img.height * scale))
+        x     = (cw - nw) // 2
+        y     = (ch - nh) // 2
 
         if checker and img.mode == "RGBA":
-            # チェッカーパターン背景に合成して透明度を可視化
-            bg = _make_checker(nw, nh)
+            bg_img = Image.new("RGBA", (nw, nh), (255,255,255,255))
+            draw   = ImageDraw.Draw(bg_img)
+            sz = 12
+            for r in range(0, nh, sz):
+                for col in range(0, nw, sz):
+                    if ((r // sz) + (col // sz)) % 2 == 1:
+                        draw.rectangle([col, r, col+sz, r+sz], fill=(180,180,180,255))
             resized = img.resize((nw, nh), Image.LANCZOS)
-            bg.paste(resized, (0, 0), resized)
-            display = bg
+            bg_img.paste(resized, (0,0), resized)
+            display = bg_img
         else:
             display = img.resize((nw, nh), Image.LANCZOS)
 
         tk_img = ImageTk.PhotoImage(display)
         canvas.delete("all")
         canvas.create_image(x, y, anchor="nw", image=tk_img)
-        # PhotoImage を保持（GC対策）
-        if canvas is self._canvas_before:
-            self._tk_before = tk_img
-        else:
-            self._tk_after = tk_img
+        setattr(self, attr, tk_img)
 
-    def _redraw_after(self):
-        if self._result_image is not None:
-            self._draw_preview(self._canvas_after, self._result_image, checker=True)
+    # ================================================================
+    # ツール管理
+    # ================================================================
 
-    def _clear_canvas(self, canvas: tk.Canvas):
-        canvas.delete("all")
+    def _select_tool(self, tool_id: str):
+        self._current_tool = tool_id
+        c = self._c
+        for t, btn in self._tool_btns.items():
+            btn.configure(
+                bg=c.accent_primary if t == tool_id else c.bg_tertiary,
+                fg=c.bg_primary     if t == tool_id else c.text_primary,
+            )
+        tool_names = {
+            self._TOOL_POINT:        "ポイント除去",
+            self._TOOL_RECT:         "矩形選択除去",
+            self._TOOL_ELLIPSE:      "楕円選択除去",
+            self._TOOL_LASSO:        "投げ縄選択",
+            self._TOOL_BRUSH_ERASE:  "消去ブラシ",
+            self._TOOL_BRUSH_RESTORE:"復元ブラシ",
+        }
+        self._tool_info_var.set(f"ツール: {tool_names.get(tool_id, tool_id)}")
+        # 投げ縄をリセット
+        self._lasso_points = []
+        self._lasso_drawing = False
 
-    # ------------------------------------------------------------------ #
+    def _confirm_lasso(self, event=None):
+        """投げ縄確定（ダブルクリック）"""
+        if (self._current_tool == self._TOOL_LASSO
+                and len(self._lasso_points) >= 3
+                and self._work_arr is not None):
+            self._push_history()
+            self._work_arr = self._processor.remove_by_lasso(
+                self._work_arr, self._lasso_points)
+            self._lasso_points = []
+            self._lasso_drawing = False
+            self._refresh_all_previews()
+
+    # ================================================================
+    # 履歴（Undo）
+    # ================================================================
+
+    def _push_history(self):
+        if self._work_arr is not None:
+            if _NUMPY_AVAILABLE:
+                self._history_stack.append(self._work_arr.copy())
+            if len(self._history_stack) > 30:
+                self._history_stack.pop(0)
+
+    def _undo(self):
+        if self._history_stack:
+            self._work_arr = self._history_stack.pop()
+            self._refresh_all_previews()
+            self._set_status("元に戻しました")
+
+    def _reset_to_original(self):
+        if self._src_image is not None and _NUMPY_AVAILABLE:
+            if messagebox.askyesno("確認", "すべての編集をリセットしますか？", parent=self):
+                self._push_history()
+                self._work_arr = np.array(self._src_image.convert("RGBA"))
+                self._history_stack.clear()
+                self._refresh_all_previews()
+                self._set_status("リセットしました")
+
+    # ================================================================
+    # ファイル操作
+    # ================================================================
+
+    def _open_file(self):
+        path = filedialog.askopenfilename(
+            title="画像を選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp *.tiff"),
+                       ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        self._load_image_file(path)
+
+    def _open_sheet(self):
+        path = filedialog.askopenfilename(
+            title="スプライトシートを選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        self._load_image_file(path)
+        self._set_status("シートを開きました。右パネルの「一括処理」から行・列を設定して実行してください。")
+
+    def _load_image_file(self, path: str):
+        try:
+            img = Image.open(path).convert("RGBA")
+            self._src_image = img
+            self._work_arr  = np.array(img) if _NUMPY_AVAILABLE else None
+            self._history_stack.clear()
+            self._batch_results.clear()
+            self._batch_listbox.delete(0, "end")
+            self._save_btn.configure(state="disabled")
+            self._save_batch_btn.configure(state="disabled")
+            self._refresh_all_previews()
+            self._set_status(f"読み込み完了: {Path(path).name}  ({img.width}×{img.height}px)")
+        except Exception as e:
+            self._set_status(f"読み込みエラー: {e}", error=True)
+
+    def _select_bg_image(self):
+        path = filedialog.askopenfilename(
+            title="背景画像を選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp"), ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path or not _NUMPY_AVAILABLE or not _PIL_AVAILABLE:
+            return
+        try:
+            img = Image.open(path).convert("RGBA")
+            self._bg_image = np.array(img)
+            self._bg_type_var.set("image")
+            self._refresh_result_preview()
+        except Exception as e:
+            self._set_status(f"背景画像エラー: {e}", error=True)
+
+    # ================================================================
+    # 処理実行
+    # ================================================================
+
+    def _run_auto_remove(self):
+        if self._work_arr is None:
+            self._set_status("画像を開いてください", error=True)
+            return
+        if self._processing:
+            return
+        self._processing = True
+        self._push_history()
+        self._progress.start(10)
+        self._set_status("自動背景除去中...")
+        threading.Thread(target=self._do_auto_remove, daemon=True).start()
+
+    def _do_auto_remove(self):
+        try:
+            result = self._processor.remove_background_adaptive(
+                self._work_arr, sensitivity=self._sensitivity.get())
+            self.after(0, self._on_auto_remove_done, result)
+        except Exception as e:
+            self.after(0, self._on_process_error, str(e))
+
+    def _on_auto_remove_done(self, result: "np.ndarray"):
+        self._work_arr = result
+        self._progress.stop()
+        self._processing = False
+        self._save_btn.configure(state="normal")
+        self._refresh_all_previews()
+        self._set_status("自動背景除去完了")
+
+    def _run_batch_process(self):
+        if self._src_image is None:
+            self._set_status("シート画像を開いてください", error=True)
+            return
+        if self._processing:
+            return
+
+        rows = self._sheet_rows.get()
+        cols = self._sheet_cols.get()
+        total = rows * cols
+        pose_names = [f"cell_{i:02d}" for i in range(total)]
+
+        self._processing = True
+        self._progress.start(10)
+        self._set_status(f"一括処理中... (全{total}セル)")
+        self._batch_listbox.delete(0, "end")
+
+        def _run():
+            def on_prog(current, total, msg):
+                self.after(0, lambda: self._set_status(msg))
+            results = self._processor.process_all_cells(
+                self._src_image, rows, cols, pose_names, on_progress=on_prog)
+            self.after(0, self._on_batch_done, results)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_batch_done(self, results: Dict[str, Image.Image]):
+        self._batch_results = results
+        self._progress.stop()
+        self._processing = False
+        self._batch_listbox.delete(0, "end")
+        for name in results.keys():
+            self._batch_listbox.insert("end", name)
+        if results:
+            self._save_batch_btn.configure(state="normal")
+        self._set_status(f"一括処理完了: {len(results)} セル")
+
+    def _on_batch_select(self, event):
+        sel = self._batch_listbox.curselection()
+        if not sel:
+            return
+        name = self._batch_listbox.get(sel[0])
+        img  = self._batch_results.get(name)
+        if img is not None and _NUMPY_AVAILABLE:
+            self._push_history()
+            self._work_arr = np.array(img)
+            self._save_btn.configure(state="normal")
+            self._refresh_all_previews()
+
+    def _on_process_error(self, msg: str):
+        self._progress.stop()
+        self._processing = False
+        self._set_status(f"エラー: {msg}", error=True)
+
+    def _show_edges(self):
+        if self._work_arr is None:
+            return
+        if not _NUMPY_AVAILABLE:
+            self._set_status("numpyが必要です", error=True)
+            return
+        edge_map = self._processor.detect_edges_highquality(self._work_arr)
+        edge_img = Image.fromarray(edge_map).convert("RGBA")
+        self._draw_to_canvas(self._canvas_result, edge_img, "_tk_result")
+        self._set_status("エッジ検出マップを表示中")
+
+    # ================================================================
+    # 保存処理（確認ダイアログ付き）
+    # ================================================================
+
+    def _save_with_confirm(self):
+        if self._work_arr is None:
+            return
+        result_img = Image.fromarray(self._work_arr)
+        self._show_save_dialog({"single": result_img})
+
+    def _save_batch_with_confirm(self):
+        if not self._batch_results:
+            return
+        self._show_save_dialog(self._batch_results)
+
+    def _show_save_dialog(self, images: Dict[str, Image.Image]):
+        """
+        保存確認ダイアログ。
+        - 保存する / しない の選択
+        - 保存先フォルダ選択
+        - カスタム名 / 連番名の選択
+        - ポーズ名マッピング（単体の場合）
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("保存確認")
+        dlg.geometry("500x420")
+        dlg.configure(bg=self._c.bg_primary)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        c = self._c
+
+        tk.Label(dlg, text="画像を保存しますか？",
+                 bg=c.bg_primary, fg=c.text_primary,
+                 font=("Segoe UI", 13, "bold")).pack(pady=16)
+
+        tk.Label(dlg, text=f"対象: {len(images)} 枚",
+                 bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 10)).pack()
+
+        # 保存先フォルダ
+        tk.Label(dlg, text="保存先フォルダ:", bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(12, 0))
+        dir_frame = tk.Frame(dlg, bg=c.bg_primary)
+        dir_frame.pack(fill="x", padx=20, pady=2)
+        default_dir = str(_WIN_ROOT / "assets" / "images")
+        dir_var = tk.StringVar(value=default_dir)
+        dir_entry = tk.Entry(dir_frame, textvariable=dir_var, bg=c.bg_tertiary,
+                             fg=c.text_primary, insertbackground=c.text_primary,
+                             relief="flat", font=("Segoe UI", 9), highlightthickness=1,
+                             highlightbackground=c.border)
+        dir_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        tk.Button(dir_frame, text="参照", command=lambda: dir_var.set(
+            filedialog.askdirectory(initialdir=dir_var.get(), parent=dlg) or dir_var.get()
+        ), bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+                  font=("Segoe UI", 9), padx=6, pady=3, cursor="hand2").pack(side="left", padx=4)
+
+        # 命名モード
+        tk.Label(dlg, text="ファイル命名:", bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(10, 0))
+        name_mode = tk.StringVar(value="pose")
+        modes = [
+            ("pose",     "ポーズ名 (alice_default 等)"),
+            ("custom",   "カスタム名"),
+            ("sequence", "連番 (image_001, image_002...)"),
+        ]
+        if len(images) > 1:
+            modes = [("sequence", "連番 (image_001, image_002...)"),
+                     ("custom_prefix", "プレフィックス + 連番")]
+        for val, lbl in modes:
+            tk.Radiobutton(dlg, text=lbl, variable=name_mode, value=val,
+                           bg=c.bg_primary, fg=c.text_secondary,
+                           selectcolor=c.bg_tertiary,
+                           font=("Segoe UI", 9)).pack(anchor="w", padx=30)
+
+        # カスタム名入力
+        tk.Label(dlg, text="カスタム名 / プレフィックス:",
+                 bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(6, 0))
+        custom_var = tk.StringVar(value=self._custom_name_var.get()
+                                  or self._POSE_FILE_MAP.get(self._pose_var.get(), "output"))
+        tk.Entry(dlg, textvariable=custom_var, bg=c.bg_tertiary,
+                 fg=c.text_primary, insertbackground=c.text_primary,
+                 relief="flat", font=("Segoe UI", 10), highlightthickness=1,
+                 highlightbackground=c.border).pack(fill="x", padx=20, ipady=3)
+
+        # ボタン行
+        btn_row = tk.Frame(dlg, bg=c.bg_primary)
+        btn_row.pack(pady=16)
+
+        def _do_save():
+            dest_dir = Path(dir_var.get())
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            mode     = name_mode.get()
+            custom   = custom_var.get().strip() or "output"
+            pose_key = self._pose_var.get()
+            saved = []
+
+            try:
+                if len(images) == 1 and mode == "pose":
+                    # ポーズ名で保存
+                    fname = self._POSE_FILE_MAP.get(pose_key, custom) + ".png"
+                    path  = dest_dir / fname
+                    list(images.values())[0].save(path, "PNG")
+                    saved.append(str(path))
+                elif mode in ("custom", "pose"):
+                    fname = custom + ".png"
+                    path  = dest_dir / fname
+                    list(images.values())[0].save(path, "PNG")
+                    saved.append(str(path))
+                elif mode == "sequence":
+                    for idx, img in enumerate(images.values()):
+                        fname = f"image_{idx+1:03d}.png"
+                        path  = dest_dir / fname
+                        img.save(path, "PNG")
+                        saved.append(str(path))
+                elif mode == "custom_prefix":
+                    for idx, img in enumerate(images.values()):
+                        fname = f"{custom}_{idx+1:03d}.png"
+                        path  = dest_dir / fname
+                        img.save(path, "PNG")
+                        saved.append(str(path))
+
+                dlg.destroy()
+                self._set_status(f"保存完了: {len(saved)} 枚 → {dest_dir}")
+                logger.info(f"画像保存: {saved}")
+
+                # CharacterLoader リロード
+                if self._char_loader is not None:
+                    self._char_loader.reload()
+                if self._on_reload is not None:
+                    self.after(200, self._on_reload)
+
+                messagebox.showinfo(
+                    "保存完了",
+                    f"{len(saved)} 枚を保存しました。\n保存先: {dest_dir}",
+                    parent=self,
+                )
+            except Exception as e:
+                messagebox.showerror("保存エラー", str(e), parent=dlg)
+
+        tk.Button(btn_row, text="💾 保存する", command=_do_save,
+                  bg=c.accent_primary, fg=c.text_primary,
+                  relief="flat", font=("Segoe UI", 11, "bold"),
+                  padx=24, pady=8, cursor="hand2").pack(side="left", padx=8)
+
+        tk.Button(btn_row, text="✕ 保存しない", command=dlg.destroy,
+                  bg=c.bg_tertiary, fg=c.text_secondary,
+                  relief="flat", font=("Segoe UI", 11),
+                  padx=24, pady=8, cursor="hand2").pack(side="left", padx=8)
+
+    # ================================================================
     # ユーティリティ
-    # ------------------------------------------------------------------ #
+    # ================================================================
+
+    def _run_inpaint(self):
+        """
+        現在の作業画像の透明領域（除去済み部分）を
+        周囲のピクセルで Inpaint（穴埋め補完）する。
+        """
+        if self._work_arr is None:
+            self._set_status("画像を開いてください", error=True)
+            return
+        if self._processing:
+            return
+        if not _NUMPY_AVAILABLE:
+            self._set_status("numpy が必要です", error=True)
+            return
+
+        self._processing = True
+        self._push_history()
+        self._progress.start(10)
+        self._set_status("Inpaint 処理中...")
+
+        radius = self._inpaint_radius.get()
+
+        def _do():
+            try:
+                mask   = self._processor.create_inpaint_mask_from_alpha(self._work_arr)
+                if not mask.any():
+                    self.after(0, lambda: self._set_status("透明領域なし、Inpaintをスキップ"))
+                    self.after(0, self._finish_processing)
+                    return
+                result = self._processor.inpaint_region(self._work_arr, mask, radius=radius)
+                self.after(0, self._on_inpaint_done, result)
+            except Exception as e:
+                self.after(0, self._on_process_error, str(e))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_inpaint_done(self, result: "np.ndarray"):
+        self._work_arr = result
+        self._finish_processing()
+        self._refresh_all_previews()
+        self._set_status("Inpaint 完了")
+
+    def _finish_processing(self):
+        self._progress.stop()
+        self._processing = False
+
+    def _open_animation_from_here(self):
+        """
+        現在の処理済み画像（または一括処理結果）を
+        AnimationCompositeDialog に渡してアニメーション作成へ移行する。
+        """
+        # 現在の work_arr から PIL Image を作成
+        import_images: Dict[str, "Image.Image"] = {}
+
+        if self._batch_results:
+            import_images = dict(self._batch_results)
+        elif self._work_arr is not None and _PIL_AVAILABLE and _NUMPY_AVAILABLE:
+            pose = self._pose_var.get() if hasattr(self, "_pose_var") else "default"
+            import_images[pose] = Image.fromarray(self._work_arr)
+
+        if not import_images:
+            self._set_status("アニメーションに送る画像がありません", error=True)
+            return
+
+        # AnimationCompositeDialog を開く
+        dlg = AnimationCompositeDialog(
+            self.master,
+            char_loader=self._char_loader,
+        )
+
+        # 処理済み画像を自動レイヤーとして追加
+        def _after_open():
+            for name, img in import_images.items():
+                dlg._add_layer(img, name)
+
+        dlg.after(200, _after_open)
+        self._set_status(f"アニメーション作成ツールへ {len(import_images)} 枚を送りました")
 
     def _set_status(self, msg: str, error: bool = False):
         self._status_var.set(msg)
-        self._status_lbl.configure(
-            fg=self._c.error_color if error else self._c.text_muted)
+        color = getattr(self._c, 'accent_error', '#f87171') if error else self._c.text_muted
+        logger.info(f"[BgRemoval] {msg}") if not error else logger.warning(f"[BgRemoval] {msg}")
 
-    def _btn(self, parent, c, text: str, cmd, bg: str, fg: str) -> tk.Button:
+    def _btn(self, parent, c, text: str, cmd, bg=None, fg=None) -> tk.Button:
         return tk.Button(
-            parent, text=text, command=cmd, bg=bg, fg=fg,
-            font=("Segoe UI", 10), relief="flat", padx=12, pady=5,
-            activebackground=c.bg_tertiary, activeforeground=c.text_primary,
-            cursor="hand2",
+            parent, text=text, command=cmd,
+            bg=bg or c.bg_tertiary, fg=fg or c.text_primary,
+            font=("Segoe UI", 9), relief="flat", padx=8, pady=5,
+            activebackground=c.bg_hover, cursor="hand2",
         )
 
 
 # ================================================================== #
-# 背景除去アルゴリズム（スタンドアロン関数）
+# 後方互換: BgRemovalDialog → AdvancedBgRemovalDialog のエイリアス
 # ================================================================== #
 
-def _remove_background(src_img: "Image.Image") -> "Image.Image":
+class BgRemovalDialog(AdvancedBgRemovalDialog):
+    """後方互換性のためのエイリアスクラス。"""
+    pass
+
+
+# ================================================================== #
+# パーツ合成・アニメーション作成ダイアログ
+# ================================================================== #
+
+class AnimationCompositeDialog(tk.Toplevel):
     """
-    白背景画像からキャラクターだけを切り抜いて RGBA で返す。
+    パーツと被写体を合成して新しいキャラクターアニメーションを作成するダイアログ。
 
-    アルゴリズム:
-      1. 純白(255,255,255) BFS で外周から除去
-      2. GrabCut で「キャラクター領域」を補完
-      3. BFS非背景 ∪ GrabCut前景 → 前景マスク
-      4. 小クラスタ(< 100px)のノイズ除去
-      5. 穴埋め
-      6. 1.5px フェザリングでソフトエッジ
+    機能:
+      1. レイヤー管理（背景・被写体・前景パーツの重ね合わせ）
+      2. パーツ位置・スケール・不透明度の調整
+      3. アニメーションフレーム管理（複数フレーム構成）
+      4. フレームプレビュー（コマ送り再生）
+      5. GIF / 連番PNG 書き出し（外部ライブラリ不要）
+      6. Inpaint統合（除去した穴を補完してから合成）
+
+    独自アルゴリズム:
+      - アルファブレンディング（Porter-Duff Over 合成）
+      - 双線形補間リサイズ（PIL LANCZOS）
+      - フレーム差分圧縮（GIF Palette量子化）
     """
-    arr = np.array(src_img.convert("RGBA"))
-    h, w = arr.shape[:2]
 
-    # Step1: 純白 BFS ─────────────────────────────────────────────────
-    rgb = arr[:, :, :3].astype(np.int32)
-    is_pure_white = (rgb[:,:,0]==255) & (rgb[:,:,1]==255) & (rgb[:,:,2]==255)
+    # フレームのデフォルト設定
+    _DEFAULT_FPS   = 12
+    _DEFAULT_DELAY = 83   # ms (≒12fps)
 
-    visited = np.zeros((h, w), dtype=bool)
-    q = deque()
-    def _seed(r, c):
-        if not visited[r,c] and is_pure_white[r,c]:
-            visited[r,c] = True; q.append((r,c))
-    for r in range(h): _seed(r,0); _seed(r,w-1)
-    for c in range(w): _seed(0,c); _seed(h-1,c)
-    nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-    while q:
-        r, c = q.popleft()
-        for dr, dc in nb8:
-            nr, nc = r+dr, c+dc
-            if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and is_pure_white[nr,nc]:
-                visited[nr,nc] = True; q.append((nr,nc))
-    bfs_bg = visited
+    def __init__(self, parent, char_loader=None):
+        super().__init__(parent)
+        self._char_loader = char_loader
+        self._processor   = AdvancedImageProcessor()
 
-    # Step2: GrabCut ───────────────────────────────────────────────────
-    bgr = cv2.cvtColor(arr[:,:,:3], cv2.COLOR_RGB2BGR)
-    rect = (8, 8, w-16, h-16)
-    mask_gc = np.zeros((h,w), np.uint8)
-    bgd = np.zeros((1,65), np.float64); fgd = np.zeros((1,65), np.float64)
-    cv2.grabCut(bgr, mask_gc, rect, bgd, fgd, 15, cv2.GC_INIT_WITH_RECT)
-    gc_fg = (mask_gc==cv2.GC_FGD) | (mask_gc==cv2.GC_PR_FGD)
+        # レイヤー管理
+        self._layers: List[Dict] = []          # 各レイヤー: {name, img, x, y, scale, alpha, visible}
+        self._selected_layer: Optional[int] = None
 
-    # Step3: 組み合わせ前景 ────────────────────────────────────────────
-    fg = (~bfs_bg) | gc_fg
+        # フレーム管理
+        self._frames: List["np.ndarray"] = []  # 合成済みフレーム一覧
+        self._current_frame: int = 0
+        self._playing: bool = False
+        self._fps = self._DEFAULT_FPS
 
-    # Step4: 小クラスタ除去 ────────────────────────────────────────────
-    labeled, num = ndimage.label(fg.astype(np.uint8))
-    sizes = ndimage.sum(fg, labeled, range(1, num+1))
-    for i, s in enumerate(sizes):
-        if s < 100:
-            fg[labeled == (i+1)] = False
+        # キャンバスサイズ
+        self._canvas_w = 512
+        self._canvas_h = 512
 
-    # Step5: 穴埋め ────────────────────────────────────────────────────
-    fg = ndimage.binary_fill_holes(fg)
+        # TkImage保持
+        self._tk_preview: Optional[ImageTk.PhotoImage] = None
 
-    # Step6: フェザリング ──────────────────────────────────────────────
-    dist_in  = ndimage.distance_transform_edt(fg).astype(np.float32)
-    dist_out = ndimage.distance_transform_edt(~fg).astype(np.float32)
-    FEATHER = 1.5
-    alpha_f = np.clip(dist_in / FEATHER, 0.0, 1.0)
-    alpha_f[fg & (dist_out > FEATHER*2)] = 1.0
-    alpha = (alpha_f * 255).astype(np.uint8)
+        self._setup_theme()
+        self.title("キャラクターアニメーション作成 - Alice AI")
+        self.geometry("1300x820")
+        self.minsize(1100, 700)
+        self.configure(bg=self._c.bg_primary)
+        self.transient(parent)
+        self.grab_set()
+        self._build_ui()
 
-    result = arr.copy()
-    result[:,:,3] = alpha
-    return Image.fromarray(result)
+    def _setup_theme(self):
+        try:
+            from module import env_binder_module as env
+            theme_name = env.get("APP_THEME", "dark")
+        except Exception:
+            theme_name = "dark"
+        self._c = Theme.get(theme_name)
+
+    # ================================================================
+    # UI構築
+    # ================================================================
+
+    def _build_ui(self):
+        c = self._c
+        main = tk.Frame(self, bg=c.bg_primary)
+        main.pack(fill="both", expand=True)
+
+        self._build_layer_panel(main, c)
+        self._build_canvas_area(main, c)
+        self._build_right_panel(main, c)
+        self._build_bottom_bar(c)
+
+    def _build_layer_panel(self, parent, c):
+        """左: レイヤーパネル"""
+        lp = tk.Frame(parent, bg=c.bg_secondary, width=220)
+        lp.pack(side="left", fill="y", padx=(0, 2))
+        lp.pack_propagate(False)
+
+        tk.Label(lp, text="📋 レイヤー", bg=c.bg_secondary, fg=c.accent_primary,
+                 font=("Segoe UI", 11, "bold")).pack(pady=(10, 4), padx=8, anchor="w")
+
+        # レイヤー追加ボタン群
+        btn_row = tk.Frame(lp, bg=c.bg_secondary)
+        btn_row.pack(fill="x", padx=6, pady=2)
+        for txt, cmd in [("+ 画像", self._add_layer_from_file),
+                          ("+ キャラ", self._add_layer_from_char),
+                          ("🗑", self._remove_layer)]:
+            tk.Button(btn_row, text=txt, command=cmd,
+                      bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                      font=("Segoe UI", 8), padx=6, pady=3,
+                      cursor="hand2", activebackground=c.accent_primary,
+                      ).pack(side="left", padx=1)
+
+        # レイヤーリスト
+        self._layer_listbox = tk.Listbox(
+            lp, bg=c.bg_tertiary, fg=c.text_primary, selectbackground=c.accent_primary,
+            relief="flat", font=("Segoe UI", 9), height=8,
+        )
+        self._layer_listbox.pack(fill="x", padx=6, pady=4)
+        self._layer_listbox.bind("<<ListboxSelect>>", self._on_layer_select)
+
+        # レイヤー順序変更
+        ord_row = tk.Frame(lp, bg=c.bg_secondary)
+        ord_row.pack(fill="x", padx=6)
+        for txt, cmd in [("↑ 上へ", self._move_layer_up), ("↓ 下へ", self._move_layer_down)]:
+            tk.Button(ord_row, text=txt, command=cmd,
+                      bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+                      font=("Segoe UI", 8), padx=8, pady=3,
+                      cursor="hand2").pack(side="left", padx=2)
+
+        tk.Frame(lp, bg=c.border, height=1).pack(fill="x", padx=6, pady=8)
+
+        # レイヤープロパティ
+        tk.Label(lp, text="🔧 レイヤー設定", bg=c.bg_secondary, fg=c.accent_primary,
+                 font=("Segoe UI", 10, "bold")).pack(padx=8, anchor="w")
+
+        def prop_row(label, var, from_, to_, res=1):
+            f = tk.Frame(lp, bg=c.bg_secondary)
+            f.pack(fill="x", padx=8, pady=1)
+            tk.Label(f, text=label, bg=c.bg_secondary, fg=c.text_secondary,
+                     font=("Segoe UI", 8), width=6, anchor="w").pack(side="left")
+            tk.Scale(f, variable=var, from_=from_, to=to_, resolution=res,
+                     orient="horizontal", bg=c.bg_secondary, fg=c.text_primary,
+                     troughcolor=c.bg_tertiary, highlightthickness=0,
+                     command=lambda _: self._refresh_composite(),
+                     ).pack(side="left", fill="x", expand=True)
+
+        self._prop_x     = tk.IntVar(value=0)
+        self._prop_y     = tk.IntVar(value=0)
+        self._prop_scale = tk.DoubleVar(value=1.0)
+        self._prop_alpha = tk.IntVar(value=255)
+        prop_row("X位置", self._prop_x,     -512, 512)
+        prop_row("Y位置", self._prop_y,     -512, 512)
+        prop_row("スケール", self._prop_scale, 0.1, 4.0, 0.05)
+        prop_row("不透明度", self._prop_alpha,  0,   255)
+
+        tk.Button(lp, text="レイヤー設定を適用", command=self._apply_layer_props,
+                  bg=c.accent_primary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 9), padx=8, pady=4, cursor="hand2",
+                  ).pack(fill="x", padx=8, pady=4)
+
+        # Inpaint ボタン
+        tk.Frame(lp, bg=c.border, height=1).pack(fill="x", padx=6, pady=4)
+        tk.Label(lp, text="🔨 Inpaint（穴埋め）", bg=c.bg_secondary, fg=c.accent_primary,
+                 font=("Segoe UI", 10, "bold")).pack(padx=8, anchor="w")
+        tk.Button(lp, text="選択レイヤーをInpaint",
+                  command=self._inpaint_selected_layer,
+                  bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 9), padx=8, pady=4, cursor="hand2",
+                  ).pack(fill="x", padx=8, pady=2)
+
+    def _build_canvas_area(self, parent, c):
+        """中央: 合成プレビューキャンバス"""
+        ca = tk.Frame(parent, bg=c.bg_primary)
+        ca.pack(side="left", fill="both", expand=True, padx=4)
+
+        tk.Label(ca, text="🎨 合成プレビュー", bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=4)
+
+        # キャンバスサイズ選択
+        sz_row = tk.Frame(ca, bg=c.bg_primary)
+        sz_row.pack(fill="x", padx=4)
+        tk.Label(sz_row, text="サイズ:", bg=c.bg_primary, fg=c.text_secondary,
+                 font=("Segoe UI", 8)).pack(side="left")
+        self._canvas_size_var = tk.StringVar(value="512x512")
+        ttk.Combobox(sz_row, textvariable=self._canvas_size_var,
+                     values=["256x256", "512x512", "1024x1024"],
+                     state="readonly", width=10, font=("Segoe UI", 8),
+                     ).pack(side="left", padx=4)
+        tk.Button(sz_row, text="適用", command=self._apply_canvas_size,
+                  bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+                  font=("Segoe UI", 8), padx=6, cursor="hand2",
+                  ).pack(side="left")
+
+        self._composite_canvas = tk.Canvas(
+            ca, bg="#1a1a2e", highlightthickness=1,
+            highlightbackground=c.border, cursor="fleur",
+        )
+        self._composite_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self._composite_canvas.bind("<Configure>", lambda e: self._refresh_composite())
+
+    def _build_right_panel(self, parent, c):
+        """右: フレーム管理・書き出し"""
+        rp = tk.Frame(parent, bg=c.bg_secondary, width=260)
+        rp.pack(side="right", fill="y", padx=(2, 0))
+        rp.pack_propagate(False)
+
+        def section(text):
+            tk.Label(rp, text=text, bg=c.bg_secondary, fg=c.accent_primary,
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+
+        def sep():
+            tk.Frame(rp, bg=c.border, height=1).pack(fill="x", padx=10, pady=4)
+
+        # ── フレーム操作 ──
+        section("🎬 フレーム管理")
+        frame_row = tk.Frame(rp, bg=c.bg_secondary)
+        frame_row.pack(fill="x", padx=10, pady=2)
+        for txt, cmd in [("+ フレーム追加", self._add_frame),
+                          ("🗑 削除", self._remove_frame)]:
+            tk.Button(frame_row, text=txt, command=cmd,
+                      bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                      font=("Segoe UI", 8), padx=6, pady=3,
+                      cursor="hand2").pack(side="left", padx=2)
+
+        self._frame_listbox = tk.Listbox(
+            rp, height=8, bg=c.bg_tertiary, fg=c.text_primary,
+            selectbackground=c.accent_primary, relief="flat",
+            font=("Segoe UI", 9),
+        )
+        self._frame_listbox.pack(fill="x", padx=10, pady=2)
+        self._frame_listbox.bind("<<ListboxSelect>>", self._on_frame_select)
+
+        # フレームコピー
+        tk.Button(rp, text="現在の合成をフレームに追加",
+                  command=self._capture_frame,
+                  bg=c.accent_secondary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 9), padx=8, pady=4, cursor="hand2",
+                  ).pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ── 再生 ──
+        section("▶ プレビュー再生")
+        fps_row = tk.Frame(rp, bg=c.bg_secondary)
+        fps_row.pack(fill="x", padx=10)
+        tk.Label(fps_row, text="FPS:", bg=c.bg_secondary, fg=c.text_secondary,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._fps_var = tk.IntVar(value=self._DEFAULT_FPS)
+        tk.Spinbox(fps_row, from_=1, to=60, textvariable=self._fps_var,
+                   width=4, bg=c.bg_tertiary, fg=c.text_primary,
+                   buttonbackground=c.bg_tertiary,
+                   command=lambda: setattr(self, "_fps", self._fps_var.get()),
+                   ).pack(side="left", padx=4)
+
+        play_row = tk.Frame(rp, bg=c.bg_secondary)
+        play_row.pack(fill="x", padx=10, pady=4)
+        self._play_btn = tk.Button(play_row, text="▶ 再生",
+                                   command=self._toggle_play,
+                                   bg=c.accent_primary, fg=c.text_primary, relief="flat",
+                                   font=("Segoe UI", 10, "bold"), padx=12, pady=5,
+                                   cursor="hand2")
+        self._play_btn.pack(side="left", padx=2)
+        tk.Button(play_row, text="⏹ 停止", command=self._stop_play,
+                  bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+                  font=("Segoe UI", 10), padx=10, pady=5,
+                  cursor="hand2").pack(side="left", padx=2)
+
+        sep()
+
+        # ── 書き出し ──
+        section("💾 書き出し")
+        tk.Button(rp, text="🎞 GIF アニメ書き出し",
+                  command=self._export_gif,
+                  bg=c.accent_primary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 10, "bold"), padx=8, pady=6,
+                  cursor="hand2").pack(fill="x", padx=10, pady=2)
+        tk.Button(rp, text="🖼 連番PNG書き出し",
+                  command=self._export_png_sequence,
+                  bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 10), padx=8, pady=6,
+                  cursor="hand2").pack(fill="x", padx=10, pady=2)
+        tk.Button(rp, text="🖼 現在フレームをPNG保存",
+                  command=self._export_current_frame,
+                  bg=c.bg_tertiary, fg=c.text_primary, relief="flat",
+                  font=("Segoe UI", 10), padx=8, pady=6,
+                  cursor="hand2").pack(fill="x", padx=10, pady=2)
+
+        sep()
+
+        # ステータス
+        self._anim_status_var = tk.StringVar(value="レイヤーを追加してください")
+        tk.Label(rp, textvariable=self._anim_status_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Segoe UI", 8),
+                 wraplength=230, justify="left").pack(padx=10, pady=4)
+
+        tk.Button(rp, text="閉じる", command=self.destroy,
+                  bg=c.bg_tertiary, fg=c.text_secondary, relief="flat",
+                  font=("Segoe UI", 9), padx=10, pady=4,
+                  cursor="hand2").pack(side="bottom", pady=8)
+
+    def _build_bottom_bar(self, c):
+        bb = tk.Frame(self, bg=c.bg_secondary, height=26)
+        bb.pack(fill="x", side="bottom")
+        bb.pack_propagate(False)
+        self._frame_info_var = tk.StringVar(value="フレーム: 0/0")
+        tk.Label(bb, textvariable=self._frame_info_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Segoe UI", 8)).pack(side="left", padx=8)
+        self._layer_info_var = tk.StringVar(value="レイヤー: 0")
+        tk.Label(bb, textvariable=self._layer_info_var, bg=c.bg_secondary,
+                 fg=c.text_muted, font=("Segoe UI", 8)).pack(side="right", padx=8)
+
+    # ================================================================
+    # レイヤー操作
+    # ================================================================
+
+    def _add_layer_from_file(self):
+        path = filedialog.askopenfilename(
+            title="パーツ画像を選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.bmp *.webp"), ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path or not _PIL_AVAILABLE:
+            return
+        try:
+            img = Image.open(path).convert("RGBA")
+            name = Path(path).stem
+            self._add_layer(img, name)
+        except Exception as e:
+            messagebox.showerror("エラー", str(e), parent=self)
+
+    def _add_layer_from_char(self):
+        """CharacterLoader からキャラクター画像をレイヤーに追加"""
+        if not self._char_loader:
+            messagebox.showwarning("警告", "CharacterLoader が利用できません", parent=self)
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("ポーズ選択")
+        dlg.geometry("240x180")
+        dlg.configure(bg=self._c.bg_primary)
+        dlg.transient(self)
+        dlg.grab_set()
+        poses = ["default", "idle", "speaking", "thinking", "greeting"]
+        tk.Label(dlg, text="追加するポーズを選択:", bg=self._c.bg_primary,
+                 fg=self._c.text_primary, font=("Segoe UI", 10)).pack(pady=10)
+        pose_var = tk.StringVar(value="default")
+        for p in poses:
+            tk.Radiobutton(dlg, text=p, variable=pose_var, value=p,
+                           bg=self._c.bg_primary, fg=self._c.text_secondary,
+                           selectcolor=self._c.bg_tertiary,
+                           font=("Segoe UI", 9)).pack(anchor="w", padx=20)
+        def _ok():
+            pose = pose_var.get()
+            img  = self._char_loader.get_image(pose)
+            if img is not None:
+                self._add_layer(img, f"char_{pose}")
+            dlg.destroy()
+        tk.Button(dlg, text="追加", command=_ok,
+                  bg=self._c.accent_primary, fg=self._c.text_primary,
+                  relief="flat", font=("Segoe UI", 9), padx=12, pady=4,
+                  cursor="hand2").pack(pady=8)
+
+    def _add_layer(self, img: "Image.Image", name: str):
+        layer = {
+            "name":    name,
+            "img":     img,
+            "x":       0,
+            "y":       0,
+            "scale":   1.0,
+            "alpha":   255,
+            "visible": True,
+        }
+        self._layers.append(layer)
+        self._layer_listbox.insert("end", name)
+        self._layer_listbox.selection_clear(0, "end")
+        self._layer_listbox.selection_set("end")
+        self._selected_layer = len(self._layers) - 1
+        self._update_layer_info()
+        self._refresh_composite()
+        self._anim_status_var.set(f"レイヤー '{name}' を追加しました")
+
+    def _remove_layer(self):
+        if self._selected_layer is None or not self._layers:
+            return
+        idx = self._selected_layer
+        name = self._layers[idx]["name"]
+        self._layers.pop(idx)
+        self._layer_listbox.delete(idx)
+        self._selected_layer = None
+        self._update_layer_info()
+        self._refresh_composite()
+        self._anim_status_var.set(f"レイヤー '{name}' を削除しました")
+
+    def _move_layer_up(self):
+        if self._selected_layer is None or self._selected_layer == 0:
+            return
+        i = self._selected_layer
+        self._layers[i], self._layers[i-1] = self._layers[i-1], self._layers[i]
+        name = self._layers[i-1]["name"]
+        self._layer_listbox.delete(i-1, i)
+        self._layer_listbox.insert(i-1, self._layers[i-1]["name"])
+        self._layer_listbox.insert(i,   self._layers[i]["name"])
+        self._selected_layer = i - 1
+        self._layer_listbox.selection_set(i-1)
+        self._refresh_composite()
+
+    def _move_layer_down(self):
+        if self._selected_layer is None or self._selected_layer >= len(self._layers) - 1:
+            return
+        i = self._selected_layer
+        self._layers[i], self._layers[i+1] = self._layers[i+1], self._layers[i]
+        self._layer_listbox.delete(i, i+1)
+        self._layer_listbox.insert(i,   self._layers[i]["name"])
+        self._layer_listbox.insert(i+1, self._layers[i+1]["name"])
+        self._selected_layer = i + 1
+        self._layer_listbox.selection_set(i+1)
+        self._refresh_composite()
+
+    def _on_layer_select(self, event):
+        sel = self._layer_listbox.curselection()
+        if not sel:
+            return
+        self._selected_layer = sel[0]
+        layer = self._layers[self._selected_layer]
+        self._prop_x.set(layer["x"])
+        self._prop_y.set(layer["y"])
+        self._prop_scale.set(layer["scale"])
+        self._prop_alpha.set(layer["alpha"])
+
+    def _apply_layer_props(self):
+        if self._selected_layer is None:
+            return
+        layer = self._layers[self._selected_layer]
+        layer["x"]     = self._prop_x.get()
+        layer["y"]     = self._prop_y.get()
+        layer["scale"] = self._prop_scale.get()
+        layer["alpha"] = self._prop_alpha.get()
+        self._refresh_composite()
+
+    def _update_layer_info(self):
+        self._layer_info_var.set(f"レイヤー: {len(self._layers)}")
+
+    # ================================================================
+    # Inpaint統合
+    # ================================================================
+
+    def _inpaint_selected_layer(self):
+        """選択レイヤーの透明領域をInpaintで補完する"""
+        if self._selected_layer is None or not _NUMPY_AVAILABLE or not _PIL_AVAILABLE:
+            return
+        layer = self._layers[self._selected_layer]
+        img   = layer["img"]
+        arr   = np.array(img.convert("RGBA"))
+        mask  = self._processor.create_inpaint_mask_from_alpha(arr)
+        if not mask.any():
+            self._anim_status_var.set("透明領域がないためInpaintをスキップ")
+            return
+        self._anim_status_var.set("Inpaint処理中...")
+        self.update_idletasks()
+
+        def _run():
+            inpainted = self._processor.inpaint_region(arr, mask, radius=6)
+            result_img = Image.fromarray(inpainted)
+            self.after(0, self._on_inpaint_done, result_img)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_inpaint_done(self, img: "Image.Image"):
+        if self._selected_layer is None:
+            return
+        self._layers[self._selected_layer]["img"] = img
+        self._refresh_composite()
+        self._anim_status_var.set("Inpaint完了")
+
+    # ================================================================
+    # 合成処理（Porter-Duff Over合成）
+    # ================================================================
+
+    def _composite_all_layers(self) -> Optional["Image.Image"]:
+        """
+        全レイヤーを下から上へ Porter-Duff Over 合成して返す。
+        独自アルファブレンディング実装。
+        """
+        if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
+            return None
+
+        w, h = self._canvas_w, self._canvas_h
+        canvas = np.zeros((h, w, 4), dtype=np.float32)
+
+        for layer in self._layers:
+            if not layer["visible"]:
+                continue
+
+            img   = layer["img"].convert("RGBA")
+            scale = layer["scale"]
+            nw    = max(1, int(img.width  * scale))
+            nh    = max(1, int(img.height * scale))
+            scaled = img.resize((nw, nh), Image.LANCZOS)
+            arr    = np.array(scaled).astype(np.float32)
+
+            # レイヤーアルファを適用
+            arr[:, :, 3] = arr[:, :, 3] * (layer["alpha"] / 255.0)
+
+            # キャンバスへの貼り付け座標
+            lx = layer["x"]
+            ly = layer["y"]
+            cx0 = max(0, lx)
+            cy0 = max(0, ly)
+            cx1 = min(w, lx + nw)
+            cy1 = min(h, ly + nh)
+            sx0 = cx0 - lx
+            sy0 = cy0 - ly
+            sx1 = sx0 + (cx1 - cx0)
+            sy1 = sy0 + (cy1 - cy0)
+
+            if cx0 >= cx1 or cy0 >= cy1:
+                continue
+
+            # Porter-Duff Over: dst = src + dst * (1 - src_alpha)
+            src_region = arr[sy0:sy1, sx0:sx1]
+            dst_region = canvas[cy0:cy1, cx0:cx1]
+            src_a = src_region[:, :, 3:4] / 255.0
+            dst_a = dst_region[:, :, 3:4] / 255.0
+            out_a = src_a + dst_a * (1 - src_a)
+            mask  = out_a > 1e-6
+
+            for ch in range(3):
+                blend = np.where(
+                    mask[:, :, 0],
+                    (src_region[:, :, ch] * src_a[:, :, 0]
+                     + dst_region[:, :, ch] * dst_a[:, :, 0] * (1 - src_a[:, :, 0]))
+                    / np.where(mask[:, :, 0], out_a[:, :, 0], 1),
+                    0,
+                )
+                canvas[cy0:cy1, cx0:cx1, ch] = blend
+            canvas[cy0:cy1, cx0:cx1, 3] = out_a[:, :, 0] * 255
+
+        return Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8))
+
+    def _refresh_composite(self):
+        """合成結果をキャンバスに描画"""
+        if not _PIL_AVAILABLE:
+            return
+        img = self._composite_all_layers()
+        if img is None:
+            return
+        self._draw_composite_to_canvas(img)
+
+    def _draw_composite_to_canvas(self, img: "Image.Image"):
+        canvas = self._composite_canvas
+        canvas.update_idletasks()
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        # チェッカー背景で透明度を可視化
+        bg = Image.new("RGBA", (cw, ch), (40, 40, 60, 255))
+        sz = 12
+        draw = ImageDraw.Draw(bg)
+        for y in range(0, ch, sz):
+            for x in range(0, cw, sz):
+                if ((x // sz) + (y // sz)) % 2 == 1:
+                    draw.rectangle([x, y, x+sz, y+sz], fill=(60, 60, 80, 255))
+        scale = min(cw / max(img.width, 1), ch / max(img.height, 1)) * 0.95
+        nw    = max(1, int(img.width * scale))
+        nh    = max(1, int(img.height * scale))
+        x     = (cw - nw) // 2
+        y     = (ch - nh) // 2
+        resized = img.resize((nw, nh), Image.LANCZOS)
+        bg.paste(resized, (x, y), resized)
+        self._tk_preview = ImageTk.PhotoImage(bg)
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor="nw", image=self._tk_preview)
+
+    def _apply_canvas_size(self):
+        sz_str = self._canvas_size_var.get()
+        try:
+            w, h = map(int, sz_str.split("x"))
+            self._canvas_w = w
+            self._canvas_h = h
+            self._refresh_composite()
+        except Exception:
+            pass
+
+    # ================================================================
+    # フレーム管理
+    # ================================================================
+
+    def _add_frame(self):
+        """空フレームを追加"""
+        if not _NUMPY_AVAILABLE:
+            return
+        frame = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.uint8)
+        self._frames.append(frame)
+        self._frame_listbox.insert("end", f"Frame {len(self._frames):03d}")
+        self._update_frame_info()
+
+    def _remove_frame(self):
+        sel = self._frame_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._frames.pop(idx)
+        self._frame_listbox.delete(idx)
+        self._update_frame_info()
+
+    def _capture_frame(self):
+        """現在の合成結果をフレームとして追加"""
+        if not _PIL_AVAILABLE or not _NUMPY_AVAILABLE:
+            return
+        img = self._composite_all_layers()
+        if img is None:
+            return
+        arr = np.array(img.convert("RGBA"))
+        self._frames.append(arr)
+        self._frame_listbox.insert("end", f"Frame {len(self._frames):03d}")
+        self._update_frame_info()
+        self._anim_status_var.set(f"フレーム {len(self._frames)} をキャプチャしました")
+
+    def _on_frame_select(self, event):
+        sel = self._frame_listbox.curselection()
+        if not sel or not _PIL_AVAILABLE:
+            return
+        idx = sel[0]
+        self._current_frame = idx
+        if idx < len(self._frames):
+            img = Image.fromarray(self._frames[idx])
+            self._draw_composite_to_canvas(img)
+
+    def _update_frame_info(self):
+        self._frame_info_var.set(f"フレーム: {self._current_frame + 1}/{len(self._frames)}")
+
+    # ================================================================
+    # 再生
+    # ================================================================
+
+    def _toggle_play(self):
+        if self._playing:
+            self._stop_play()
+        else:
+            if not self._frames:
+                self._anim_status_var.set("フレームがありません")
+                return
+            self._playing = True
+            self._fps = self._fps_var.get()
+            self._play_btn.configure(text="⏸ 一時停止")
+            self._anim_status_var.set("再生中...")
+            self._play_loop()
+
+    def _stop_play(self):
+        self._playing = False
+        self._play_btn.configure(text="▶ 再生")
+        self._anim_status_var.set("停止")
+
+    def _play_loop(self):
+        if not self._playing or not self._frames:
+            return
+        idx = self._current_frame % len(self._frames)
+        img = Image.fromarray(self._frames[idx])
+        self._draw_composite_to_canvas(img)
+        self._current_frame = (idx + 1) % len(self._frames)
+        self._update_frame_info()
+        delay_ms = max(16, 1000 // max(1, self._fps))
+        self.after(delay_ms, self._play_loop)
+
+    # ================================================================
+    # 書き出し
+    # ================================================================
+
+    def _export_gif(self):
+        """フレームをGIFアニメとして書き出す"""
+        if not self._frames:
+            messagebox.showwarning("警告", "フレームがありません", parent=self)
+            return
+        if not _PIL_AVAILABLE:
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="GIF書き出し先を選択",
+            defaultextension=".gif",
+            filetypes=[("GIF ファイル", "*.gif"), ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+
+        if not messagebox.askyesno("確認", f"{len(self._frames)}フレームのGIFを書き出しますか？", parent=self):
+            return
+
+        try:
+            pil_frames = []
+            for arr in self._frames:
+                img = Image.fromarray(arr).convert("RGBA")
+                # GIF は RGB+パレット → RGBA → P変換
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                pil_frames.append(bg.convert("P", palette=Image.ADAPTIVE, colors=256))
+
+            delay_ms = max(16, 1000 // max(1, self._fps_var.get()))
+            pil_frames[0].save(
+                path, format="GIF", save_all=True,
+                append_images=pil_frames[1:],
+                duration=delay_ms, loop=0, optimize=False,
+            )
+            self._anim_status_var.set(f"GIF書き出し完了: {Path(path).name}")
+            messagebox.showinfo("完了", f"GIFを書き出しました:\n{path}", parent=self)
+        except Exception as e:
+            messagebox.showerror("エラー", str(e), parent=self)
+
+    def _export_png_sequence(self):
+        """フレームを連番PNGとして書き出す"""
+        if not self._frames:
+            messagebox.showwarning("警告", "フレームがありません", parent=self)
+            return
+
+        dest_dir = filedialog.askdirectory(title="連番PNG書き出し先フォルダ", parent=self)
+        if not dest_dir:
+            return
+
+        prefix = simpledialog.askstring(
+            "プレフィックス", "ファイル名プレフィックス:", initialvalue="frame", parent=self)
+        if prefix is None:
+            return
+
+        if not messagebox.askyesno("確認", f"{len(self._frames)}枚のPNGを書き出しますか？", parent=self):
+            return
+
+        try:
+            dest = Path(dest_dir)
+            for i, arr in enumerate(self._frames):
+                img  = Image.fromarray(arr)
+                fname = dest / f"{prefix}_{i+1:04d}.png"
+                img.save(fname, "PNG")
+            self._anim_status_var.set(f"連番PNG書き出し完了: {len(self._frames)} 枚")
+            messagebox.showinfo("完了", f"{len(self._frames)}枚を書き出しました:\n{dest_dir}", parent=self)
+        except Exception as e:
+            messagebox.showerror("エラー", str(e), parent=self)
+
+    def _export_current_frame(self):
+        """現在フレームを単体PNGで保存"""
+        if not self._frames:
+            messagebox.showwarning("警告", "フレームがありません", parent=self)
+            return
+
+        # 保存確認
+        if not messagebox.askyesno("確認", "現在のフレームをPNGとして保存しますか？", parent=self):
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="PNG保存先",
+            defaultextension=".png",
+            filetypes=[("PNG ファイル", "*.png"), ("すべて", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            idx = self._current_frame % max(len(self._frames), 1)
+            img = Image.fromarray(self._frames[idx])
+            img.save(path, "PNG")
+            self._anim_status_var.set(f"保存完了: {Path(path).name}")
+        except Exception as e:
+            messagebox.showerror("エラー", str(e), parent=self)
 
 
-def _make_checker(w: int, h: int, size: int = 12) -> "Image.Image":
-    """チェッカーパターン背景画像を生成する（透明度の視覚化用）。"""
-    bg = Image.new("RGBA", (w, h), (255,255,255,255))
-    dark = (200, 200, 200, 255)
-    px = bg.load()
-    for y in range(h):
-        for x in range(w):
-            if ((x // size) + (y // size)) % 2 == 1:
-                px[x, y] = dark
-    return bg
-
-
-# ================================================================== #
-# 設定ダイアログ
-# ================================================================== #
 
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, env_binder, on_save: Optional[Callable] = None):
@@ -682,7 +2841,6 @@ class SettingsDialog(tk.Toplevel):
         self._row_str(f, c, "Remote URL", "GIT_URL")
         self._row_str(f, c, "Branch", "GIT_BRANCH")
 
-    # ---- ウィジェットヘルパー ----
     def _row_str(self, f, c, label, key, show=None):
         r = tk.Frame(f, bg=c.bg_primary); r.pack(fill="x", padx=14, pady=4)
         tk.Label(r, text=label, bg=c.bg_primary, fg=c.text_secondary,
@@ -876,15 +3034,10 @@ class AliceMainWindow:
     """
     AliceApp のメインGUIウィンドウ。
     AliceApp.py から各エンジンを受け取り、表示と操作を担当する。
-
-    レイアウト: ttk.PanedWindow によるリサイズ可能な 左右分割
-      - 左ペイン（チャット）: 初期比率 65%
-      - 右ペイン（キャラクター）: 初期比率 35%
     """
 
-    # 左右ペインの初期幅比率（チャット : キャラクター）
-    _CHAT_RATIO   = 0.62
-    _CHAR_RATIO   = 0.38
+    _CHAT_RATIO = 0.62
+    _CHAR_RATIO = 0.38
 
     def __init__(
         self,
@@ -902,7 +3055,7 @@ class AliceMainWindow:
 
         theme_name = env_binder.get("APP_THEME") if env_binder else "dark"
         self.colors = Theme.get(theme_name)
-        self._mode = AppMode.DESKTOP
+        self._mode  = AppMode.DESKTOP
 
         self._msg_queue: queue.Queue = queue.Queue()
         self._streaming_started = False
@@ -955,36 +3108,32 @@ class AliceMainWindow:
                           activebackground=c.accent_primary, relief="flat")
         self.root.configure(menu=menubar)
 
-        # ファイル
         fm = menu(menubar)
         fm.add_command(label="設定", command=self._open_settings, accelerator="Ctrl+,")
         fm.add_separator()
         fm.add_command(label="終了", command=self._on_close)
         menubar.add_cascade(label="ファイル", menu=fm)
 
-        # 表示
         vm = menu(menubar)
         vm.add_command(label="チャット履歴をクリア", command=self._clear_chat)
         menubar.add_cascade(label="表示", menu=vm)
 
-        # Git
         gm = menu(menubar)
         gm.add_command(label="Git マネージャー", command=self._open_git_dialog)
         gm.add_command(label="クイックコミット",  command=self._quick_commit)
         gm.add_command(label="ブランチ切替...",   command=self._switch_branch_dialog)
         menubar.add_cascade(label="Git", menu=gm)
 
-        # ツール
         tm = menu(menubar)
         tm.add_command(label="キャラクター再読み込み", command=self._reload_character)
-        tm.add_command(label="背景除去ツール",         command=self._open_bg_removal)
+        tm.add_command(label="🎨 高度な画像処理ツール", command=self._open_advanced_image_tool)
+        tm.add_command(label="🎬 アニメーション作成ツール", command=self._open_animation_tool)
         tm.add_separator()
         tm.add_command(label="VOICEVOX 接続確認",     command=self._check_voicevox)
         tm.add_separator()
         tm.add_command(label="ログフォルダを開く",    command=self._open_logs)
         menubar.add_cascade(label="ツール", menu=tm)
 
-        # ヘルプ
         hm = menu(menubar)
         hm.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="ヘルプ", menu=hm)
@@ -992,18 +3141,13 @@ class AliceMainWindow:
         self.root.bind("<Control-comma>", lambda e: self._open_settings())
         self.root.bind("<Return>",        lambda e: self._on_send())
 
-    # ---- デスクトップUI構築 ----
-
     def _build_desktop_ui(self):
         c = self.colors
         layout = get_layout(AppMode.DESKTOP)
 
-        # ── PanedWindow でチャット / キャラクターを左右に分割 ──────────
-        # sashrelief="flat" + sashwidth=6 でスリムな仕切り線
         self._paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self._paned.pack(fill="both", expand=True)
 
-        # 左ペイン: チャットエリア
         chat_frame = tk.Frame(self._paned, bg=c.bg_primary)
         self._paned.add(chat_frame, weight=62)
 
@@ -1011,24 +3155,18 @@ class AliceMainWindow:
         self._build_chat_display(chat_frame, c)
         self._build_input_area(chat_frame, c)
 
-        # 右ペイン: キャラクターエリア
         char_frame = tk.Frame(self._paned, bg=c.bg_secondary)
         self._paned.add(char_frame, weight=38)
 
         self._build_character_panel(char_frame, c, layout)
-
-        # 初期サッシ位置を遅延設定（ウィンドウ描画後に実行）
         self.root.after(50, self._set_initial_sash)
-
         self._build_status_bar(c)
 
     def _set_initial_sash(self):
-        """ウィンドウ幅に応じてサッシ初期位置を設定する。"""
         try:
             total = self.root.winfo_width()
             if total > 10:
-                sash_pos = int(total * self._CHAT_RATIO)
-                self._paned.sashpos(0, sash_pos)
+                self._paned.sashpos(0, int(total * self._CHAT_RATIO))
         except Exception:
             pass
 
@@ -1138,12 +3276,6 @@ class AliceMainWindow:
     # ---- サービス起動 ----
 
     def _start_services(self):
-        # キャラクター読み込みは 800ms 後に開始する。
-        # CharacterLoader.initialize() がバックグラウンドで preload を
-        # 走らせており、200ms では競合してキャッシュが空のまま
-        # get_image() が呼ばれる場合があった。
-        # get_image() はキャッシュになければファイルから直接読み込むため
-        # 結果は正しいが、遅延を増やすことで preload 完了後に参照できるようにする。
         self.root.after(800, self._load_character)
         self.root.after(1200, self._show_greeting)
 
@@ -1312,12 +3444,26 @@ class AliceMainWindow:
         self._load_character()
         self._update_status("キャラクターを再読み込みしました。")
 
-    def _open_bg_removal(self):
-        """背景除去ダイアログを開く。"""
-        dlg = BgRemovalDialog(
+    def _open_advanced_image_tool(self):
+        """高度な画像処理ツールを開く（旧 BgRemovalDialog を置き換え）"""
+        dlg = AdvancedBgRemovalDialog(
             self.root,
             char_loader=self._char_loader,
             on_reload=self._reload_character,
+        )
+        # 投げ縄ダブルクリック確定バインド
+        dlg._canvas_src.bind("<Double-Button-1>", dlg._confirm_lasso)
+        self.root.wait_window(dlg)
+
+    def _open_bg_removal(self):
+        """後方互換: 高度な画像処理ツールを開く"""
+        self._open_advanced_image_tool()
+
+    def _open_animation_tool(self):
+        """キャラクターアニメーション作成ツールを開く"""
+        dlg = AnimationCompositeDialog(
+            self.root,
+            char_loader=self._char_loader,
         )
         self.root.wait_window(dlg)
 
@@ -1339,7 +3485,11 @@ class AliceMainWindow:
         messagebox.showinfo(
             "Alice AI について",
             "Alice AI\n\nInspired by Maid-chan from\nSakurasou no Pet na Kanojo\n\n"
-            "Powered by Google Gemini × VOICEVOX"
+            "Powered by Google Gemini × VOICEVOX\n\n"
+            "画像処理: 独自アルゴリズム（API不使用）\n"
+            "  - 高精度エッジ検出 (Sobel+Laplacian融合)\n"
+            "  - Lab色空間適応的背景除去\n"
+            "  - ポイント/矩形/楕円/投げ縄/ブラシ編集"
         )
 
     def _update_status(self, text):
