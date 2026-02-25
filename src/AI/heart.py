@@ -22,8 +22,8 @@ AI推論の心臓部（中層構造）。
 修正:
   - _stream() の generate_content_stream 呼び出しを
     コンテキストマネージャ形式と直接イテラブル形式の両方に対応させた。
-    google-genai のバージョンによって返却型が異なるため、
-    __enter__ の有無を確認してから適切な方法でストリームを読み取る。
+  - chunk.text アクセスを getattr で安全化（安全フィルタ等でテキストなしの
+    チャンクが返ることがあるため AttributeError を防止）。
 """
 
 from __future__ import annotations
@@ -56,11 +56,6 @@ class AliceHeart:
     """
 
     def __init__(self, client: Any, model_name: str) -> None:
-        """
-        Args:
-            client:     neural_loader_module.load() が返す Gemini クライアント
-            model_name: 使用するモデル名
-        """
         self._client = client
         self._model_name = model_name
         logger.info(f"AliceHeart 初期化完了 (APIキー・モデル検証済み): model={model_name}")
@@ -76,38 +71,11 @@ class AliceHeart:
     ) -> Dict[str, Any]:
         """
         推論を実行し、結果を dict で返す。
-
-        処理順序（直列・逆流禁止）:
-          1. 内部コンテキスト構築
-          2. AI推論実行
-          3. レスポンス整形
-          4. 結果返却
-
-        Args:
-            payload:  prompt_shaper_module.build_payload() が返した dict
-            on_chunk: ストリーミング時の各チャンクコールバック（任意）
-
-        Returns:
-            {
-                "response": str,       # 生成テキスト
-                "success": bool,       # 成功フラグ
-                "error": str | None,   # エラーメッセージ（失敗時）
-                "elapsed_ms": int,     # 処理時間（ミリ秒）
-                "model": str,          # 使用モデル名
-            }
         """
         t_start = time.monotonic()
-
-        # Step 1: 内部コンテキスト構築
         ctx = self._build_context(payload)
-
-        # Step 2: AI推論実行
         raw_response, error = self._run_inference(ctx, on_chunk)
-
-        # Step 3: レスポンス整形
         shaped = self._shape_response(raw_response, error)
-
-        # Step 4: 結果返却
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
         return {
             "response": shaped,
@@ -122,7 +90,6 @@ class AliceHeart:
     # ============================================================
 
     def _build_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """ペイロードから推論コンテキストを構築する。"""
         return {
             "contents": payload.get("contents", []),
             "system_instruction": payload.get("system_instruction", ""),
@@ -139,12 +106,6 @@ class AliceHeart:
         ctx: Dict[str, Any],
         on_chunk: Optional[Callable[[str], None]],
     ) -> tuple:
-        """
-        Gemini API を呼び出す。リトライは 429 のみ対象。
-
-        Returns:
-            (response_text, error_message | None)
-        """
         if not _TYPES_AVAILABLE:
             return "", "google-genai の types モジュールが利用できません。"
 
@@ -164,7 +125,6 @@ class AliceHeart:
             except Exception as exc:
                 exc_str = str(exc)
 
-                # 429: レート制限 → リトライ
                 if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str:
                     wait = self._parse_retry_delay(exc)
                     if attempt < _MAX_RETRIES - 1:
@@ -180,7 +140,6 @@ class AliceHeart:
                         continue
                     return "", self._format_error(exc)
 
-                # それ以外はリトライしない
                 logger.error(f"推論エラー: {exc}")
                 return "", self._format_error(exc)
 
@@ -195,10 +154,9 @@ class AliceHeart:
         """
         ストリーミング推論。
 
-        修正: google-genai のバージョンによって generate_content_stream() が
-              コンテキストマネージャ（with 文対応）を返す場合と、
-              直接イテラブルを返す場合がある。
-              __enter__ 属性の有無で判定し、両方のパターンに対応する。
+        修正: chunk.text を getattr で安全にアクセス。
+        安全フィルタ等によりテキストを持たないチャンクが返る場合があり、
+        直接 chunk.text を参照すると AttributeError が発生する。
         """
         full = ""
         response = self._client.models.generate_content_stream(
@@ -207,25 +165,26 @@ class AliceHeart:
             config=cfg,
         )
 
-        # コンテキストマネージャ形式か直接イテラブルかを判定
+        def _process_chunk(chunk) -> None:
+            nonlocal full
+            # 【修正】chunk.text → getattr で AttributeError を防止
+            text = getattr(chunk, "text", None) or ""
+            full += text
+            if text:
+                on_chunk(text)
+
         if hasattr(response, "__enter__"):
             # コンテキストマネージャ形式（旧 API）
             stream = response.__enter__()
             try:
                 for chunk in stream:
-                    text = chunk.text or ""
-                    full += text
-                    if text:
-                        on_chunk(text)
+                    _process_chunk(chunk)
             finally:
                 response.__exit__(None, None, None)
         else:
             # 直接イテラブル形式（新 API）
             for chunk in response:
-                text = chunk.text or ""
-                full += text
-                if text:
-                    on_chunk(text)
+                _process_chunk(chunk)
 
         return full
 
@@ -236,25 +195,24 @@ class AliceHeart:
             contents=contents,
             config=cfg,
         )
-        return resp.text or ""
+        # 【修正】resp.text も getattr で安全にアクセス
+        return getattr(resp, "text", None) or ""
 
     # ============================================================
     # Step 3: レスポンス整形
     # ============================================================
 
     def _shape_response(self, raw: str, error: Optional[str]) -> str:
-        """生の推論結果を整形する。"""
         if error:
             return ""
         return raw.strip()
 
     # ============================================================
-    # ユーティリティ（推論レイヤー内部のみ使用）
+    # ユーティリティ
     # ============================================================
 
     @staticmethod
     def _parse_retry_delay(exc: Exception) -> float:
-        """429レスポンスから retryDelay を取得する。"""
         import re
         m = re.search(r"retryDelay.*?(\d+)s", str(exc))
         if m:
@@ -263,7 +221,6 @@ class AliceHeart:
 
     @staticmethod
     def _format_error(exc: Exception) -> str:
-        """エラーをユーザー向けメッセージに変換する。"""
         msg = str(exc)
         if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
             return (

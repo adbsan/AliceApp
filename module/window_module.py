@@ -1132,13 +1132,16 @@ class AdvancedImageProcessor:
         k: int,
         max_iter: int,
     ) -> "np.ndarray":
-        """純粋numpy K-means（Lloyd法）"""
+        """純粋numpy K-means（Lloyd法）。kmeans++ 初期化を完全ベクトル化。"""
         n = len(data)
-        # kmeans++ 初期化
+        # kmeans++ 初期化（完全ベクトル化・Pythonループなし）
         centers = [data[np.random.randint(n)]]
         for _ in range(k - 1):
-            d2 = np.array([min(((x - c) ** 2).sum() for c in centers) for x in data])
-            probs = d2 / d2.sum()
+            # 全データ点と既存センター間の最小二乗距離をベクトル化で計算
+            centers_arr = np.array(centers)                                  # (c, F)
+            diffs = data[:, np.newaxis, :] - centers_arr[np.newaxis, :, :]  # (n, c, F)
+            d2 = (diffs ** 2).sum(axis=2).min(axis=1)                       # (n,)
+            probs = d2 / (d2.sum() + 1e-12)
             centers.append(data[np.random.choice(n, p=probs)])
         centers = np.array(centers)
 
@@ -1337,8 +1340,7 @@ class AdvancedImageProcessor:
         hair_cand &= region_mask
 
         if _SCIPY_AVAILABLE and hair_cand.any():
-            # 顔マスクと連結している成分のみ採用
-            combined = face_mask | hair_cand
+            # 顔マスクの拡張領域と連結している成分のみ採用
             dilated_face = ndimage.binary_dilation(face_mask, np.ones((10, 10), bool))
             hair_cand &= dilated_face | hair_cand
 
@@ -1445,25 +1447,13 @@ class AdvancedImageProcessor:
         return result
 
     def _bfs_from_point(self, is_similar, sy, sx, h, w):
-        """
-        指定座標(sy,sx)から連結した is_similar 領域を返す。
-        scipy版: ndimage.label で全連結成分を一括取得→座標のラベルを採用。
-        C実装のため Python BFS より約100倍高速。GILも解放される。
-        """
-        if not is_similar[sy, sx]:
-            return np.zeros((h, w), bool)
-
-        if _SCIPY_AVAILABLE:
-            labeled, _ = ndimage.label(is_similar)
-            target_label = labeled[sy, sx]
-            if target_label == 0:
-                return np.zeros((h, w), bool)
-            return labeled == target_label
-
-        # scipy なし時のフォールバック
         visited = np.zeros((h, w), bool)
+        if not is_similar[sy, sx]:
+            return visited
         q = deque([(sy, sx)])
         visited[sy, sx] = True
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            pass
         nb4 = [(-1,0),(1,0),(0,-1),(0,1)]
         while q:
             r, c = q.popleft()
@@ -1497,17 +1487,16 @@ class AdvancedImageProcessor:
             return np.isin(labeled, list(border_labels))
 
         # scipy 未インストール時の Python フォールバック
-        # 外周シードをnumpyで一括取得（for r in range(h) ループを排除）
         visited = np.zeros((h, w), bool)
         q = deque()
-        for r, c in zip(*np.where(is_bg[[0, h-1], :])):
-            actual_r = r * (h - 1)
-            if not visited[actual_r, c]:
-                visited[actual_r, c] = True; q.append((actual_r, c))
-        for r, c in zip(*np.where(is_bg[:, [0, w-1]])):
-            actual_c = c * (w - 1)
-            if not visited[r, actual_c]:
-                visited[r, actual_c] = True; q.append((r, actual_c))
+        for r in range(h):
+            for c in (0, w - 1):
+                if is_bg[r, c] and not visited[r, c]:
+                    visited[r, c] = True; q.append((r, c))
+        for c in range(w):
+            for r in (0, h - 1):
+                if is_bg[r, c] and not visited[r, c]:
+                    visited[r, c] = True; q.append((r, c))
         nb8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
         while q:
             r, c = q.popleft()
@@ -1613,28 +1602,82 @@ class AdvancedImageProcessor:
     # ================================================================
 
     def inpaint_region(self, img_rgba, mask, radius=8):
-        if not _NUMPY_AVAILABLE: return img_rgba
+        """
+        透明領域を周囲の既知ピクセルで補完する。
+        scipy.ndimage の uniform_filter を使ったベクトル化実装。
+        Python ネストループを排除し、GIL ブロックを最小化。
+        """
+        if not _NUMPY_AVAILABLE:
+            return img_rgba
         result = img_rgba.copy().astype(np.float32)
-        h, w = result.shape[:2]
-        fill = mask.copy()
-        for _ in range(max(h,w)//2):
-            ys, xs = np.where(fill)
-            if len(ys) == 0: break
-            changed = False
-            for y, x in zip(ys, xs):
-                y0,y1 = max(0,y-radius), min(h,y+radius+1)
-                x0,x1 = max(0,x-radius), min(w,x+radius+1)
-                valid = ~fill[y0:y1, x0:x1]
-                if not valid.any(): continue
-                ry, rx = np.mgrid[y0:y1, x0:x1]
-                dist = np.sqrt((ry-y)**2+(rx-x)**2)+1e-6
-                weight = (1/dist**2)*valid
-                ws = weight.sum()
-                if ws < 1e-6: continue
+        fill = mask.copy().astype(bool)
+
+        if not fill.any():
+            return img_rgba
+
+        if _SCIPY_AVAILABLE:
+            # ── scipy 高速パス ──────────────────────────────────────────
+            # 境界 BFS で内側から外側に向けてレイヤー毎に補完する。
+            # 各反復で「未補完ピクセルのうち既知隣接を持つ」ものだけ確定する。
+            size = radius * 2 + 1
+            known = ~fill
+
+            for _iter in range(max(result.shape[:2]) // 2 + 1):
+                ys, xs = np.where(fill)
+                if len(ys) == 0:
+                    break
+
+                # 各チャネルを均一フィルタ（既知ピクセルのみ加重）
+                new_vals = np.zeros((len(ys), 4), dtype=np.float32)
+                weights  = np.zeros(len(ys), dtype=np.float32)
+
                 for ch in range(4):
-                    result[y,x,ch] = (result[y0:y1,x0:x1,ch]*weight).sum()/ws
-                fill[y,x] = False; changed = True
-            if not changed: break
+                    ch_data  = result[:, :, ch] * known           # 未知は0
+                    w_data   = known.astype(np.float32)
+                    filt_val = ndimage.uniform_filter(ch_data, size=size)
+                    filt_w   = ndimage.uniform_filter(w_data,  size=size)
+                    new_vals[:, ch] = filt_val[ys, xs]
+                    weights          = filt_w[ys, xs]             # 最後chで上書きで可
+
+                # 既知隣接ピクセルを持つ（weight > 0）ものだけ確定
+                has_neighbor = weights > 1e-6
+                if not has_neighbor.any():
+                    break
+
+                ys_ok = ys[has_neighbor]
+                xs_ok = xs[has_neighbor]
+                for ch in range(4):
+                    result[ys_ok, xs_ok, ch] = (
+                        new_vals[has_neighbor, ch] / (weights[has_neighbor] + 1e-12)
+                    )
+                fill[ys_ok, xs_ok] = False
+                known[ys_ok, xs_ok] = True
+
+        else:
+            # ── scipy なし: 最大ピクセル数を制限して Python ループ ──────
+            MAX_PX = 2000   # フリーズ防止のための上限
+            h, w = result.shape[:2]
+            ys_all, xs_all = np.where(fill)
+            if len(ys_all) > MAX_PX:
+                idx = np.random.choice(len(ys_all), MAX_PX, replace=False)
+                ys_all, xs_all = ys_all[idx], xs_all[idx]
+
+            for y, x in zip(ys_all.tolist(), xs_all.tolist()):
+                y0, y1 = max(0, y - radius), min(h, y + radius + 1)
+                x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+                valid = ~fill[y0:y1, x0:x1]
+                if not valid.any():
+                    continue
+                ry, rx = np.mgrid[y0:y1, x0:x1]
+                dist   = np.sqrt((ry - y) ** 2 + (rx - x) ** 2) + 1e-6
+                weight = (1 / dist ** 2) * valid
+                ws     = weight.sum()
+                if ws < 1e-6:
+                    continue
+                for ch in range(4):
+                    result[y, x, ch] = (result[y0:y1, x0:x1, ch] * weight).sum() / ws
+                fill[y, x] = False
+
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def create_inpaint_mask_from_alpha(self, img_rgba):
@@ -2220,9 +2263,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         c = self._canvas_src
         c.bind("<Button-1>",       self._on_canvas_click)
         c.bind("<B1-Motion>",      self._on_canvas_drag)
-        c.bind("<ButtonRelease-1>",self._on_canvas_release)
-        c.bind("<Motion>",         self._on_canvas_motion)
-        c.bind("<Configure>",      lambda e: self._redraw_src())
+        c.bind("<ButtonRelease-1>",  self._on_canvas_release)
+        c.bind("<Motion>",           self._on_canvas_motion)
+        c.bind("<Double-Button-1>",  self._confirm_lasso)   # 投げ縄ダブルクリック確定
+        c.bind("<Configure>",        lambda e: self._redraw_src())
 
     def _canvas_to_image_coords(self, cx: int, cy: int) -> Tuple[int, int]:
         """キャンバス座標 → 画像ピクセル座標に変換"""
@@ -2564,9 +2608,12 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self.after(interval_ms, _step)
 
     def _refresh_all_previews(self):
-        """元画像と結果プレビューを両方更新"""
+        """元画像と結果プレビューを両方更新。編集済みなら保存ボタンも有効化。"""
         self._redraw_src()
         self._refresh_result_preview()
+        # 作業画像が存在する場合は保存ボタンを有効化（手動編集後にも保存可能にする）
+        if self._work_arr is not None and hasattr(self, "_save_btn"):
+            self._save_btn.configure(state="normal")
 
     def _draw_to_canvas(
         self,
@@ -3237,7 +3284,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             return
 
         self._processing = True
-        self._push_history()
         self._progress.start(10)
         self._set_status("Inpaint 処理中...")
 
@@ -3245,11 +3291,14 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         def _do():
             try:
-                mask   = self._processor.create_inpaint_mask_from_alpha(self._work_arr)
+                mask = self._processor.create_inpaint_mask_from_alpha(self._work_arr)
                 if not mask.any():
+                    # 透明領域がない場合は履歴を積まずにスキップ
                     self.after(0, lambda: self._set_status("透明領域なし、Inpaintをスキップ"))
                     self.after(0, self._finish_processing)
                     return
+                # マスクが存在する場合のみ履歴を保存（UIスレッドで実行）
+                self.after(0, self._push_history)
                 result = self._processor.inpaint_region(self._work_arr, mask, radius=radius)
                 self.after(0, self._on_inpaint_done, result)
             except Exception as e:
