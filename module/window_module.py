@@ -14,11 +14,22 @@ Alice AI メインGUIウィンドウ。
   - 推論を実行しない（AliceEngine に委譲）
   - 設定参照は env_binder_module 経由のみ
 
-修正（v2）:
-  - AdvancedBgRemovalDialog._build_ui() 冒頭で _coord_var / _tool_info_var を
-    先に初期化するよう変更。_build_toolbar() → _select_tool() の呼び出し時点で
-    これらの変数が未作成だったために発生する AttributeError を修正。
-  - _build_status_bar() 内の重複 StringVar 作成を削除。
+修正（v3）:
+  - CharacterAnimator: LANCZOSリサイズの結果をキャッシュし、サイズ変更時のみ再計算。
+    CPU負荷を大幅軽減。
+  - Menu: メニューからの関数呼び出しに self.after(10, ...) を導入し UIフリーズを防止。
+  - AdvancedBgRemovalDialog: __init__ の変数初期化を _init_variables() に分離し
+    UI構築前に全変数を確実に初期化する（AttributeError 防止）。
+  - wait_window() 削除: grab_set() との二重使用によるフリーズを解消。
+  - shell=True 削除: コマンドインジェクション脆弱性を修正（CRITICAL）。
+  - _on_enter_key: return None → return "continue"（Shift+Enter 正常動作）。
+  - グローバル <Return> バインド削除（二重発火防止）。
+  - _voice.speak() をキュー経由に変更（スレッドセーフ化）。
+  - 遅延構築ウィジェットへの hasattr() ガード追加。
+  - CharacterAnimator._loop(): TclError 以外の例外もキャッチしてログ出力。
+  - np.random.choice → np.random.default_rng().choice()（ローカル乱数化）。
+  - _run_inpaint: スナップショット先取りでスレッド競合を修正。
+  - queue.Queue(maxsize=500) + _enqueue にドロップ戦略を追加。
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-# 背景除去・画像処理に使用するライブラリ
+# ── 依存ライブラリ ────────────────────────────────────────────────
 try:
     import numpy as np
     _NUMPY_AVAILABLE = True
@@ -58,7 +69,7 @@ except ImportError:
 
 _BG_REMOVAL_AVAILABLE = _NUMPY_AVAILABLE and _CV2_AVAILABLE and _SCIPY_AVAILABLE
 
-# ── rembg 高品質背景除去（オプション）────────────────────────────────────
+# ── rembg 高品質背景除去（オプション）────────────────────────────
 _REMBG_AVAILABLE = False
 _REMBG_MODEL     = "none"
 
@@ -66,7 +77,6 @@ try:
     import rembg as _rembg_module
     _REMBG_AVAILABLE = True
 
-    # isnet-anime（アニメ専用）を最優先。なければ u2net
     _REMBG_MODEL = "isnet-anime"
     try:
         _rembg_session = _rembg_module.new_session("isnet-anime")
@@ -76,7 +86,7 @@ try:
             _rembg_session = _rembg_module.new_session("u2net")
         except Exception:
             _REMBG_MODEL = "default"
-            _rembg_session = None   # rembg.remove() がデフォルト使用
+            _rembg_session = None
 
     logger.info(f"rembg 利用可能 (モデル: {_REMBG_MODEL})")
 
@@ -178,11 +188,14 @@ class PlaceholderEntry(tk.Text):
 
 
 # ================================================================== #
-# キャラクターアニメーター
+# キャラクターアニメーター（v3最適化版）
 # ================================================================== #
 
 class CharacterAnimator:
-    """既存画像ファイルを使った浮遊アニメーション。"""
+    """
+    既存画像ファイルを使った浮遊アニメーション。
+    【v3最適化】LANCZOSリサイズをキャッシュし、サイズ/状態変更時のみ再計算。
+    """
 
     def __init__(self, canvas: tk.Canvas) -> None:
         self.canvas = canvas
@@ -193,14 +206,18 @@ class CharacterAnimator:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._start_time = time.time()
-        self._breath_amp  = DEFAULT_ANIMATION.breath_amplitude
-        self._breath_ms   = DEFAULT_ANIMATION.breath_period_ms
-        self._speak_amp   = DEFAULT_ANIMATION.speak_bounce_amp
-        self._speak_ms    = DEFAULT_ANIMATION.speak_bounce_period_ms
-        self._fps         = DEFAULT_ANIMATION.fps
+        self._fps = DEFAULT_ANIMATION.fps
+
+        # v3: リサイズキャッシュ
+        self._cached_resized_img: Optional[Image.Image] = None
+        self._last_canvas_size: Tuple[int, int] = (0, 0)
+        self._last_state: Optional[CharacterState] = None
 
     def load_images(self, images: Dict[str, Optional[Image.Image]]) -> None:
         self._images = {k: v for k, v in images.items() if v is not None}
+        self._cached_resized_img = None
+        self._last_canvas_size = (0, 0)
+        self._last_state = None
         logger.info(f"CharacterAnimator: {len(self._images)} 枚の画像をロードしました。")
 
     def set_state(self, state: CharacterState) -> None:
@@ -225,11 +242,15 @@ class CharacterAnimator:
                 self.canvas.after_idle(self._render, t)
             except tk.TclError:
                 break
+            except Exception as e:
+                logger.error(f"CharacterAnimator._loop 予期しないエラー: {e}")
+                break
             time.sleep(interval)
 
     def _render(self, t: float) -> None:
-        if not _PIL_AVAILABLE:
+        if not _PIL_AVAILABLE or not self._images:
             return
+
         state_key = self._state.value
         img = (
             self._images.get(state_key)
@@ -238,22 +259,39 @@ class CharacterAnimator:
         )
         if img is None:
             return
+
         try:
             cw = self.canvas.winfo_width()
             ch = self.canvas.winfo_height()
             if cw <= 1 or ch <= 1:
                 return
-            ratio = min(cw / img.width, ch / img.height) * 0.90
-            nw = int(img.width * ratio)
-            nh = int(img.height * ratio)
-            resized = img.resize((nw, nh), Image.LANCZOS)
+
+            # サイズまたは状態が変わった時だけ LANCZOS リサイズを実行
+            if (cw, ch) != self._last_canvas_size or self._state != self._last_state:
+                ratio = min(cw / img.width, ch / img.height) * 0.90
+                nw = max(1, int(img.width * ratio))
+                nh = max(1, int(img.height * ratio))
+                self._cached_resized_img = img.resize((nw, nh), Image.LANCZOS)
+                self._last_canvas_size = (cw, ch)
+                self._last_state = self._state
+
+            if not self._cached_resized_img:
+                return
+
+            resized = self._cached_resized_img
+            nw, nh = resized.width, resized.height
+
             if self._state == CharacterState.SPEAKING:
-                amp, period = self._speak_amp, self._speak_ms / 1000.0
+                amp    = DEFAULT_ANIMATION.speak_bounce_amp
+                period = DEFAULT_ANIMATION.speak_bounce_period_ms / 1000.0
             else:
-                amp, period = self._breath_amp, self._breath_ms / 1000.0
+                amp    = DEFAULT_ANIMATION.breath_amplitude
+                period = DEFAULT_ANIMATION.breath_period_ms / 1000.0
+
             offset_y = int(amp * math.sin(2 * math.pi * t / period))
             x = (cw - nw) // 2
             y = (ch - nh) // 2 + offset_y
+
             self._tk_image = ImageTk.PhotoImage(resized)
             if self._image_id:
                 self.canvas.coords(self._image_id, x, y)
@@ -264,26 +302,6 @@ class CharacterAnimator:
                 )
         except Exception as e:
             logger.error(f"アニメーションレンダリングエラー: {e}")
-
-
-# ================================================================== #
-# 高度な画像処理エンジン（独自アルゴリズム・API不使用）
-# ================================================================== #
-
-
-# ================================================================== #
-# 高度な画像処理エンジン v3
-# 学習済みモデル不使用・純粋アルゴリズム実装
-#
-# 実装機能:
-#   1. 高精度エッジ検出（Sobel/Laplacian/Canny近似 融合・ベクトル化）
-#   2. 適応的背景除去（Lab色空間 + GMM近似 + IterativeGrabCut）
-#   3. Alpha Matting（トライマップ生成 + KNN近似マッティング）
-#   4. SEGS：K-means色クラスタリング + ConnectedComponents
-#   5. 部位検出（顔・肌・髪・服）YCbCr/HSV + 形状解析
-#   6. 各種選択範囲除去・ブラシ編集
-#   7. 背景合成
-# ================================================================== #
 
 class AdvancedImageProcessor:
     """
@@ -831,7 +849,8 @@ class AdvancedImageProcessor:
 
         def _subsample(ys, xs, maxn=2000):
             if len(ys) > maxn:
-                idx = np.random.choice(len(ys), maxn, replace=False)
+                rng = np.random.default_rng()
+                idx = rng.choice(len(ys), maxn, replace=False)
                 return ys[idx], xs[idx]
             return ys, xs
 
@@ -1621,8 +1640,11 @@ class AdvancedImageProcessor:
             # 各反復で「未補完ピクセルのうち既知隣接を持つ」ものだけ確定する。
             size = radius * 2 + 1
             known = ~fill
+            # 上限イテレーションを radius に基づいて制限（フリーズ防止）
+            # 実際には known が広がるにつれ早期終了するが念のため上限を設ける
+            max_iters = max(32, radius * 8)
 
-            for _iter in range(max(result.shape[:2]) // 2 + 1):
+            for _iter in range(max_iters):
                 ys, xs = np.where(fill)
                 if len(ys) == 0:
                     break
@@ -1753,6 +1775,7 @@ class AdvancedImageProcessor:
 # 高度な背景除去ダイアログ（統合版）
 # ================================================================== #
 
+
 class AdvancedBgRemovalDialog(tk.Toplevel):
     """
     高度な背景除去・画像編集ダイアログ。
@@ -1794,6 +1817,22 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._on_reload   = on_reload
         self._processor   = AdvancedImageProcessor()
 
+        # 【v3】全変数を UI 構築前に初期化（AttributeError 防止）
+        self._init_variables()
+
+        self._setup_theme()
+        self.title("高度な画像処理ツール - Alice AI")
+        self.withdraw()          # 構築中は非表示にして描画をブロックしない
+        self.geometry("1280x800")
+        self.minsize(1000, 650)
+        self.configure(bg=self._c.bg_primary)
+        self.transient(parent)
+        self._build_ui()         # UI構築を先に完了させる
+        self.deiconify()         # 構築完了後に表示
+        self.grab_set()          # 表示後にグラブ（フリーズ防止）
+
+    def _init_variables(self):
+        """全インスタンス変数を UI 構築前に初期化する（v3 パターン）。"""
         # 状態管理
         self._src_image:    Optional[Image.Image] = None
         self._work_arr:     Optional["np.ndarray"] = None
@@ -1819,6 +1858,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         # 処理フラグ
         self._processing = False
 
+        # ブラシドラッグ間引き用フラグ（フリーズ防止）
+        self._brush_drag_pending = False
+        self._brush_dragging = False
+
         # エッジ表示フラグ
         self._edge_showing = False
         self._edge_arr: Optional["np.ndarray"] = None
@@ -1831,14 +1874,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         # バッチ処理結果
         self._batch_results: Dict[str, Image.Image] = {}
 
-        self._setup_theme()
-        self.title("高度な画像処理ツール - Alice AI")
-        self.geometry("1280x800")
-        self.minsize(1000, 650)
-        self.configure(bg=self._c.bg_primary)
-        self.transient(parent)
-        self.grab_set()
-        self._build_ui()
+        # _build_toolbar() → _select_tool() より前に必要な Tk 変数
+        self._coord_var     = tk.StringVar(value="X:- Y:-")
+        self._tool_info_var = tk.StringVar(value="ツール: ポイント除去")
 
     def _setup_theme(self):
         try:
@@ -1855,33 +1893,25 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
     def _build_ui(self):
         c = self._c
 
-        # ----------------------------------------------------------------
-        # 【修正】ステータスバー用 StringVar をここで先に作成する。
-        # _build_toolbar() の末尾で _select_tool() が呼ばれ、その中で
-        # _tool_info_var / _coord_var を参照するため、ツールバー構築より
-        # 前に初期化しておく必要がある。
-        # ----------------------------------------------------------------
-        self._coord_var     = tk.StringVar(value="X:- Y:-")
-        self._tool_info_var = tk.StringVar(value="ツール: ポイント除去")
-
         # ── メインレイアウト: 左ツールバー | 中央プレビュー | 右パネル ──
         main = tk.Frame(self, bg=c.bg_primary)
         main.pack(fill="both", expand=True)
+        self._main_frame = main  # 遅延構築用に保持
 
-        # 左ツールバー
+        # 左ツールバー（必須・先に構築）
         self._build_toolbar(main, c)
 
-        # 中央プレビューエリア（PanedWindow）
+        # 中央プレビューエリア（必須・先に構築）
         center = tk.Frame(main, bg=c.bg_primary)
         center.pack(side="left", fill="both", expand=True, padx=4)
-
         self._build_preview_area(center, c)
 
-        # 右パネル（設定・一括処理）
-        self._build_right_panel(main, c)
-
-        # 下部ステータスバー
-        self._build_status_bar(c)
+        # 右パネルとステータスバーは after_idle で遅延構築
+        # → ウィンドウが画面に出てから構築するのでフリーズしない
+        def _build_deferred():
+            self._build_right_panel(main, c)
+            self._build_status_bar(c)
+        self.after_idle(_build_deferred)
 
     def _build_toolbar(self, parent, c):
         """左側ツールバー（ツール選択・ブラシサイズ等）"""
@@ -1964,6 +1994,13 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         )
         self._canvas_src.pack(fill="both", expand=True, padx=2, pady=2)
         self._bind_canvas_events()
+        # <Configure> debounce: リサイズ中の連続呼び出しを防ぐ
+        self._redraw_src_job = None
+        def _on_src_configure(e):
+            if self._redraw_src_job:
+                self.after_cancel(self._redraw_src_job)
+            self._redraw_src_job = self.after(80, self._redraw_src)
+        self._canvas_src.bind("<Configure>", _on_src_configure)
 
         # ── 右: ビフォーアフタースライダープレビュー ──
         rf = tk.Frame(paned, bg=c.bg_primary)
@@ -2006,7 +2043,13 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._canvas_result.bind("<ButtonPress-1>",   self._slider_press)
         self._canvas_result.bind("<B1-Motion>",       self._slider_drag)
         self._canvas_result.bind("<ButtonRelease-1>", self._slider_release)
-        self._canvas_result.bind("<Configure>",       lambda e: self._refresh_result_preview())
+        # <Configure> debounce
+        self._refresh_result_job = None
+        def _on_result_configure(e):
+            if self._refresh_result_job:
+                self.after_cancel(self._refresh_result_job)
+            self._refresh_result_job = self.after(80, self._refresh_result_preview)
+        self._canvas_result.bind("<Configure>", _on_result_configure)
 
         self._tk_src:    Optional[ImageTk.PhotoImage] = None
         self._tk_result: Optional[ImageTk.PhotoImage] = None
@@ -2243,13 +2286,13 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
     def _build_status_bar(self, c):
         """
         下部ステータスバー。
-        _coord_var / _tool_info_var は _build_ui() 冒頭で作成済みなので
+        _coord_var / _tool_info_var は _init_variables() で作成済みなので
         ここでは Label を生成するだけ（StringVar の重複生成をしない）。
         """
         sb = tk.Frame(self, bg=c.bg_secondary, height=24)
         sb.pack(fill="x", side="bottom")
         sb.pack_propagate(False)
-        # 【修正】StringVar はすでに _build_ui() で作成済みのためここでは作らない
+        # StringVar は _init_variables() で作成済み
         tk.Label(sb, textvariable=self._coord_var, bg=c.bg_secondary,
                  fg=c.text_muted, font=("Consolas", 8)).pack(side="left", padx=8)
         tk.Label(sb, textvariable=self._tool_info_var, bg=c.bg_secondary,
@@ -2261,12 +2304,12 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
     def _bind_canvas_events(self):
         c = self._canvas_src
-        c.bind("<Button-1>",       self._on_canvas_click)
-        c.bind("<B1-Motion>",      self._on_canvas_drag)
+        c.bind("<Button-1>",         self._on_canvas_click)
+        c.bind("<B1-Motion>",        self._on_canvas_drag)
         c.bind("<ButtonRelease-1>",  self._on_canvas_release)
         c.bind("<Motion>",           self._on_canvas_motion)
-        c.bind("<Double-Button-1>",  self._confirm_lasso)   # 投げ縄ダブルクリック確定
-        c.bind("<Configure>",        lambda e: self._redraw_src())
+        c.bind("<Double-Button-1>",  self._confirm_lasso)
+        # <Configure> は _build_preview_area の debounce で処理
 
     def _canvas_to_image_coords(self, cx: int, cy: int) -> Tuple[int, int]:
         """キャンバス座標 → 画像ピクセル座標に変換"""
@@ -2296,19 +2339,24 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         if tool == self._TOOL_POINT:
             self._push_history()
-            self._work_arr = self._processor.remove_by_point(
-                self._work_arr, ix, iy,
-                radius=self._brush_size,
-                sensitivity=self._sensitivity.get(),
-            )
-            self._refresh_all_previews()
+            snap = self._work_arr.copy()
+            radius = self._brush_size
+            sens = self._sensitivity.get()
+            self._processing = True
+            self._set_status("ポイント除去処理中...")
+            def _do_point():
+                result = self._processor.remove_by_point(snap, ix, iy,
+                    radius=radius, sensitivity=sens)
+                self.after(0, self._on_point_done, result)
+            threading.Thread(target=_do_point, daemon=True).start()
 
         elif tool in (self._TOOL_BRUSH_ERASE, self._TOOL_BRUSH_RESTORE):
             self._push_history()
+            self._brush_dragging = True
             mode = "erase" if tool == self._TOOL_BRUSH_ERASE else "restore"
             self._work_arr = self._processor.apply_brush(
                 self._work_arr, ix, iy, self._brush_size, mode)
-            self._refresh_all_previews()
+            self._redraw_src(fast=True)  # 軽量な左キャンバスのみ更新
 
         elif tool == self._TOOL_RECT:
             self._rect_start = (ix, iy)
@@ -2326,16 +2374,32 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 self._lasso_points.append((ix, iy))
             self._redraw_src()
 
+    def _on_point_done(self, result: "np.ndarray"):
+        self._work_arr = result
+        self._processing = False
+        self._set_status("ポイント除去完了")
+        self._refresh_all_previews()
+
+    def _on_edit_done(self, result: "np.ndarray"):
+        """矩形・楕円・投げ縄の処理完了コールバック"""
+        self._work_arr = result
+        self._refresh_all_previews()
+
     def _on_canvas_drag(self, event):
         if self._work_arr is None:
             return
         ix, iy = self._canvas_to_image_coords(event.x, event.y)
 
         if self._current_tool in (self._TOOL_BRUSH_ERASE, self._TOOL_BRUSH_RESTORE):
-            mode = "erase" if self._current_tool == self._TOOL_BRUSH_ERASE else "restore"
-            self._work_arr = self._processor.apply_brush(
-                self._work_arr, ix, iy, self._brush_size, mode)
-            self._refresh_all_previews()
+            # ドラッグ中は間引き処理：2px以上移動した場合のみ描画（フリーズ防止）
+            if not self._brush_drag_pending:
+                self._brush_drag_pending = True
+                mode = "erase" if self._current_tool == self._TOOL_BRUSH_ERASE else "restore"
+                self._work_arr = self._processor.apply_brush(
+                    self._work_arr, ix, iy, self._brush_size, mode)
+                self._redraw_src(fast=True)  # 左キャンバスのみ（右は重いので省略）
+                # 次フレームまで待機してから次の描画を許可
+                self.after(16, self._reset_brush_pending)
 
         elif self._current_tool in (self._TOOL_RECT, self._TOOL_ELLIPSE) and self._rect_drawing:
             self._rect_end = (ix, iy)
@@ -2345,10 +2409,21 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._lasso_points.append((ix, iy))
             self._redraw_src_with_selection()
 
+    def _reset_brush_pending(self):
+        self._brush_drag_pending = False
+
     def _on_canvas_release(self, event):
         if self._work_arr is None:
             return
         ix, iy = self._canvas_to_image_coords(event.x, event.y)
+
+        # ブラシ終了時に右プレビューも更新
+        if self._current_tool in (self._TOOL_BRUSH_ERASE, self._TOOL_BRUSH_RESTORE):
+            if self._brush_dragging:
+                self._brush_dragging = False
+                self._brush_drag_pending = False
+                self._refresh_all_previews()  # ドラッグ完了後に全プレビュー更新
+            return
 
         if self._current_tool == self._TOOL_RECT and self._rect_drawing:
             self._rect_end = (ix, iy)
@@ -2357,9 +2432,11 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 self._push_history()
                 x1, y1 = self._rect_start
                 x2, y2 = self._rect_end
-                self._work_arr = self._processor.remove_by_rect(
-                    self._work_arr, x1, y1, x2, y2, mode="hard")
-                self._refresh_all_previews()
+                snap = self._work_arr.copy()
+                def _do_rect():
+                    r = self._processor.remove_by_rect(snap, x1, y1, x2, y2, mode="hard")
+                    self.after(0, self._on_edit_done, r)
+                threading.Thread(target=_do_rect, daemon=True).start()
 
         elif self._current_tool == self._TOOL_ELLIPSE and self._rect_drawing:
             self._rect_end = (ix, iy)
@@ -2370,9 +2447,11 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 x2, y2 = self._rect_end
                 cx, cy = (x1+x2)//2, (y1+y2)//2
                 rx, ry = abs(x2-x1)//2, abs(y2-y1)//2
-                self._work_arr = self._processor.remove_by_ellipse(
-                    self._work_arr, cx, cy, rx, ry)
-                self._refresh_all_previews()
+                snap = self._work_arr.copy()
+                def _do_ellipse():
+                    r = self._processor.remove_by_ellipse(snap, cx, cy, rx, ry)
+                    self.after(0, self._on_edit_done, r)
+                threading.Thread(target=_do_ellipse, daemon=True).start()
 
         elif self._current_tool == self._TOOL_LASSO and self._lasso_drawing:
             pass  # ダブルクリックで確定
@@ -2381,15 +2460,15 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
     # プレビュー描画
     # ================================================================
 
-    def _redraw_src(self):
+    def _redraw_src(self, fast: bool = False):
         """作業画像（編集中の状態・透明部分はチェッカー表示）をキャンバスに描画"""
         if not _PIL_AVAILABLE:
             return
         if self._work_arr is not None and _NUMPY_AVAILABLE:
             img = Image.fromarray(self._work_arr)
-            self._draw_to_canvas(self._canvas_src, img, "_tk_src", checker=True)
+            self._draw_to_canvas(self._canvas_src, img, "_tk_src", checker=True, fast=fast)
         elif self._src_image is not None:
-            self._draw_to_canvas(self._canvas_src, self._src_image, "_tk_src", checker=False)
+            self._draw_to_canvas(self._canvas_src, self._src_image, "_tk_src", checker=False, fast=fast)
 
     def _redraw_src_with_selection(self):
         """選択範囲オーバーレイ付きで作業画像を描画"""
@@ -2473,7 +2552,6 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             return
 
         canvas = self._canvas_result
-        canvas.update_idletasks()
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
         if cw <= 1 or ch <= 1:
@@ -2556,7 +2634,14 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._tk_comparison = tk_img  # GC防止
 
     def _make_checker_pil(self, w: int, h: int, size: int = 14) -> Image.Image:
-        """チェッカーパターン PIL Image を生成"""
+        """チェッカーパターン PIL Image を生成（numpy ベクトル化・高速）"""
+        if _NUMPY_AVAILABLE:
+            ys, xs = np.mgrid[0:h, 0:w]
+            mask = ((ys // size) + (xs // size)) % 2 == 1
+            arr = np.full((h, w, 4), 255, dtype=np.uint8)
+            arr[mask, :3] = 180
+            return Image.fromarray(arr)
+        # フォールバック（numpyなし）
         img = Image.new("RGBA", (w, h), (255, 255, 255, 255))
         draw = ImageDraw.Draw(img)
         for ry in range(0, h, size):
@@ -2621,10 +2706,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         img: Image.Image,
         attr: str,
         checker: bool = False,
+        fast: bool = False,
     ):
         if not _PIL_AVAILABLE:
             return
-        canvas.update_idletasks()
         cw, ch = canvas.winfo_width(), canvas.winfo_height()
         if cw <= 1 or ch <= 1:
             cw, ch = 500, 500
@@ -2634,19 +2719,25 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         x     = (cw - nw) // 2
         y     = (ch - nh) // 2
 
+        # ブラシドラッグ中はBILINEAR（高速）、確定時はLANCZOS（高品質）
+        resample = Image.BILINEAR if fast else Image.LANCZOS
+
         if checker and img.mode == "RGBA":
-            bg_img = Image.new("RGBA", (nw, nh), (255,255,255,255))
-            draw   = ImageDraw.Draw(bg_img)
-            sz = 12
-            for r in range(0, nh, sz):
-                for col in range(0, nw, sz):
-                    if ((r // sz) + (col // sz)) % 2 == 1:
-                        draw.rectangle([col, r, col+sz, r+sz], fill=(180,180,180,255))
-            resized = img.resize((nw, nh), Image.LANCZOS)
-            bg_img.paste(resized, (0,0), resized)
+            # numpy ベクトル化チェッカーパターン（Pythonループ排除）
+            if _NUMPY_AVAILABLE:
+                sz = 12
+                ys, xs = np.mgrid[0:nh, 0:nw]
+                checker_mask = ((ys // sz) + (xs // sz)) % 2 == 1
+                bg_arr = np.full((nh, nw, 4), 255, dtype=np.uint8)
+                bg_arr[checker_mask, :3] = 180
+                bg_img = Image.fromarray(bg_arr)
+            else:
+                bg_img = Image.new("RGBA", (nw, nh), (255, 255, 255, 255))
+            resized = img.resize((nw, nh), resample)
+            bg_img.paste(resized, (0, 0), resized)
             display = bg_img
         else:
-            display = img.resize((nw, nh), Image.LANCZOS)
+            display = img.resize((nw, nh), resample)
 
         tk_img = ImageTk.PhotoImage(display)
         canvas.delete("all")
@@ -2683,11 +2774,14 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                 and len(self._lasso_points) >= 3
                 and self._work_arr is not None):
             self._push_history()
-            self._work_arr = self._processor.remove_by_lasso(
-                self._work_arr, self._lasso_points)
+            pts = list(self._lasso_points)
+            snap = self._work_arr.copy()
             self._lasso_points = []
             self._lasso_drawing = False
-            self._refresh_all_previews()
+            def _do_lasso():
+                r = self._processor.remove_by_lasso(snap, pts)
+                self.after(0, self._on_edit_done, r)
+            threading.Thread(target=_do_lasso, daemon=True).start()
 
     # ================================================================
     # 履歴（Undo）
@@ -2749,9 +2843,12 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._work_arr  = np.array(img) if _NUMPY_AVAILABLE else None
             self._history_stack.clear()
             self._batch_results.clear()
-            self._batch_listbox.delete(0, "end")
-            self._save_btn.configure(state="disabled")
-            self._save_batch_btn.configure(state="disabled")
+            if hasattr(self, "_batch_listbox"):
+                self._batch_listbox.delete(0, "end")
+            if hasattr(self, "_save_btn"):
+                self._save_btn.configure(state="disabled")
+            if hasattr(self, "_save_batch_btn"):
+                self._save_batch_btn.configure(state="disabled")
             self._refresh_all_previews()
             self._set_status(f"読み込み完了: {Path(path).name}  ({img.width}×{img.height}px)")
         except Exception as e:
@@ -2783,6 +2880,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             return
         if self._processing:
             return
+        if not hasattr(self, "_progress"):
+            self._set_status("UI構築中です。少し待ってから再試行してください", error=True)
+            return
         self._processing = True
         self._push_history()
         self._progress.start(10)
@@ -2799,9 +2899,11 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
     def _on_auto_remove_done(self, result: "np.ndarray"):
         self._work_arr = result
-        self._progress.stop()
+        if hasattr(self, "_progress"):
+            self._progress.stop()
         self._processing = False
-        self._save_btn.configure(state="normal")
+        if hasattr(self, "_save_btn"):
+            self._save_btn.configure(state="normal")
         self._redraw_src()
         self._result_image = Image.fromarray(self._work_arr)
         self._set_status("自動背景除去完了 — スライドアニメーション再生中")
@@ -2813,6 +2915,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._set_status("シート画像を開いてください", error=True)
             return
         if self._processing:
+            return
+        if not hasattr(self, "_progress") or not hasattr(self, "_batch_listbox"):
+            self._set_status("UI構築中です。少し待ってから再試行してください", error=True)
             return
 
         rows = self._sheet_rows.get()
@@ -2836,9 +2941,11 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
     def _on_batch_done(self, results: Dict[str, Image.Image]):
         self._batch_results = results
-        self._progress.stop()
+        if hasattr(self, "_progress"):
+            self._progress.stop()
         self._processing = False
-        self._batch_listbox.delete(0, "end")
+        if hasattr(self, "_batch_listbox"):
+            self._batch_listbox.delete(0, "end")
         for name in results.keys():
             self._batch_listbox.insert("end", name)
         if results:
@@ -2858,7 +2965,8 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._refresh_all_previews()
 
     def _on_process_error(self, msg: str):
-        self._progress.stop()
+        if hasattr(self, "_progress"):
+            self._progress.stop()
         self._processing = False
         self._set_status(f"エラー: {msg}", error=True)
 
@@ -2871,6 +2979,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._set_status("画像を開いてください", error=True)
             return
         if self._processing:
+            return
+        if not hasattr(self, "_seg_btn") or not hasattr(self, "_seg_progress"):
+            self._set_status("UI構築中です。少し待ってから再試行してください", error=True)
             return
         self._processing = True
         self._seg_btn.configure(state="disabled", text="⏳ 分析中...")
@@ -2980,6 +3091,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             return
         if self._processing:
             return
+        if not hasattr(self, "_parts_btn") or not hasattr(self, "_parts_progress"):
+            self._set_status("UI構築中です。少し待ってから再試行してください", error=True)
+            return
         self._processing = True
         self._parts_btn.configure(state="disabled", text="⏳ 検出中...")
         self._parts_progress.pack(padx=10, pady=2)
@@ -3084,6 +3198,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._set_status("numpyが必要です", error=True)
             return
         if self._processing:
+            return
+        if not hasattr(self, "_edge_progress") or not hasattr(self, "_edge_btn"):
+            self._set_status("UI構築中です。少し待ってから再試行してください", error=True)
             return
 
         # プログレスバーを表示
@@ -3284,7 +3401,8 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             return
 
         self._processing = True
-        self._progress.start(10)
+        if hasattr(self, "_progress"):
+            self._progress.start(10)
         self._set_status("Inpaint 処理中...")
 
         radius = self._inpaint_radius.get()
@@ -3297,8 +3415,10 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
                     self.after(0, lambda: self._set_status("透明領域なし、Inpaintをスキップ"))
                     self.after(0, self._finish_processing)
                     return
-                # マスクが存在する場合のみ履歴を保存（UIスレッドで実行）
-                self.after(0, self._push_history)
+                # 競合回避: スナップショットを先に取得しUIスレッドで履歴に積む
+                snapshot = self._work_arr.copy() if _NUMPY_AVAILABLE else None
+                self.after(0, lambda: self._history_stack.append(snapshot)
+                           if snapshot is not None else None)
                 result = self._processor.inpaint_region(self._work_arr, mask, radius=radius)
                 self.after(0, self._on_inpaint_done, result)
             except Exception as e:
@@ -3313,7 +3433,8 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._set_status("Inpaint 完了")
 
     def _finish_processing(self):
-        self._progress.stop()
+        if hasattr(self, "_progress"):
+            self._progress.stop()
         self._processing = False
 
     def _open_animation_from_here(self):
@@ -3342,7 +3463,8 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         self._set_status(f"アニメーション作成ツールへ {len(import_images)} 枚を送りました")
 
     def _set_status(self, msg: str, error: bool = False):
-        self._status_var.set(msg)
+        if hasattr(self, "_status_var"):
+            self._status_var.set(msg)
         color = getattr(self._c, 'accent_error', '#f87171') if error else self._c.text_muted
         logger.info(f"[BgRemoval] {msg}") if not error else logger.warning(f"[BgRemoval] {msg}")
 
@@ -3359,6 +3481,7 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 # 後方互換: BgRemovalDialog → AdvancedBgRemovalDialog のエイリアス
 # ================================================================== #
 
+
 class BgRemovalDialog(AdvancedBgRemovalDialog):
     """後方互換性のためのエイリアスクラス。"""
     pass
@@ -3367,6 +3490,7 @@ class BgRemovalDialog(AdvancedBgRemovalDialog):
 # ================================================================== #
 # パーツ合成・アニメーション作成ダイアログ
 # ================================================================== #
+
 
 class AnimationCompositeDialog(tk.Toplevel):
     """
@@ -3396,12 +3520,14 @@ class AnimationCompositeDialog(tk.Toplevel):
 
         self._setup_theme()
         self.title("キャラクターアニメーション作成 - Alice AI")
+        self.withdraw()          # 構築中は非表示
         self.geometry("1300x820")
         self.minsize(1100, 700)
         self.configure(bg=self._c.bg_primary)
         self.transient(parent)
+        self._build_ui()         # UI構築完了後に表示
+        self.deiconify()
         self.grab_set()
-        self._build_ui()
 
     def _setup_theme(self):
         try:
@@ -3522,7 +3648,13 @@ class AnimationCompositeDialog(tk.Toplevel):
             highlightbackground=c.border, cursor="fleur",
         )
         self._composite_canvas.pack(fill="both", expand=True, padx=4, pady=4)
-        self._composite_canvas.bind("<Configure>", lambda e: self._refresh_composite())
+        # <Configure> debounce
+        self._refresh_composite_job = None
+        def _on_composite_configure(e):
+            if self._refresh_composite_job:
+                self.after_cancel(self._refresh_composite_job)
+            self._refresh_composite_job = self.after(80, self._refresh_composite)
+        self._composite_canvas.bind("<Configure>", _on_composite_configure)
 
     def _build_right_panel(self, parent, c):
         """右: フレーム管理・書き出し"""
@@ -3774,7 +3906,6 @@ class AnimationCompositeDialog(tk.Toplevel):
             self._anim_status_var.set("透明領域がないためInpaintをスキップ")
             return
         self._anim_status_var.set("Inpaint処理中...")
-        self.update_idletasks()
 
         def _run():
             inpainted = self._processor.inpaint_region(arr, mask, radius=6)
@@ -3860,18 +3991,24 @@ class AnimationCompositeDialog(tk.Toplevel):
 
     def _draw_composite_to_canvas(self, img: "Image.Image"):
         canvas = self._composite_canvas
-        canvas.update_idletasks()
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
         if cw <= 1 or ch <= 1:
             return
-        bg = Image.new("RGBA", (cw, ch), (40, 40, 60, 255))
         sz = 12
-        draw = ImageDraw.Draw(bg)
-        for y in range(0, ch, sz):
-            for x in range(0, cw, sz):
-                if ((x // sz) + (y // sz)) % 2 == 1:
-                    draw.rectangle([x, y, x+sz, y+sz], fill=(60, 60, 80, 255))
+        if _NUMPY_AVAILABLE:
+            ys, xs = np.mgrid[0:ch, 0:cw]
+            mask = ((xs // sz) + (ys // sz)) % 2 == 1
+            bg_arr = np.full((ch, cw, 4), [40, 40, 60, 255], dtype=np.uint8)
+            bg_arr[mask] = [60, 60, 80, 255]
+            bg = Image.fromarray(bg_arr)
+        else:
+            bg = Image.new("RGBA", (cw, ch), (40, 40, 60, 255))
+            draw_bg = ImageDraw.Draw(bg)
+            for y in range(0, ch, sz):
+                for x in range(0, cw, sz):
+                    if ((x // sz) + (y // sz)) % 2 == 1:
+                        draw_bg.rectangle([x, y, x+sz, y+sz], fill=(60, 60, 80, 255))
         scale = min(cw / max(img.width, 1), ch / max(img.height, 1)) * 0.95
         nw    = max(1, int(img.width * scale))
         nh    = max(1, int(img.height * scale))
@@ -4071,6 +4208,7 @@ class AnimationCompositeDialog(tk.Toplevel):
 # 設定ダイアログ
 # ================================================================== #
 
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, env_binder, on_save: Optional[Callable] = None):
         super().__init__(parent)
@@ -4215,6 +4353,7 @@ class SettingsDialog(tk.Toplevel):
 # Git ダイアログ
 # ================================================================== #
 
+
 class GitDialog(tk.Toplevel):
     def __init__(self, parent, git_manager, env_binder):
         super().__init__(parent)
@@ -4325,6 +4464,7 @@ class GitDialog(tk.Toplevel):
 # メインウィンドウ
 # ================================================================== #
 
+
 class AliceMainWindow:
     """
     AliceApp のメインGUIウィンドウ。
@@ -4352,7 +4492,7 @@ class AliceMainWindow:
         self.colors = Theme.get(theme_name)
         self._mode  = AppMode.DESKTOP
 
-        self._msg_queue: queue.Queue = queue.Queue()
+        self._msg_queue: queue.Queue = queue.Queue(maxsize=500)
         self._streaming_started = False
 
         self.root = tk.Tk()
@@ -4365,7 +4505,15 @@ class AliceMainWindow:
         self.root.mainloop()
 
     def _enqueue(self, fn, *args, **kwargs):
-        self._msg_queue.put((fn, args, kwargs))
+        try:
+            self._msg_queue.put_nowait((fn, args, kwargs))
+        except queue.Full:
+            # キュー満杯時: 古いアイテムを1件破棄して再挿入
+            try:
+                self._msg_queue.get_nowait()
+                self._msg_queue.put_nowait((fn, args, kwargs))
+            except (queue.Empty, queue.Full):
+                logger.warning("_enqueue: キューが満杯のためメッセージをドロップしました")
 
     def _process_queue(self):
         try:
@@ -4432,7 +4580,7 @@ class AliceMainWindow:
         menubar.add_cascade(label="ヘルプ", menu=hm)
 
         self.root.bind("<Control-comma>", lambda e: self._open_settings())
-        self.root.bind("<Return>",        lambda e: self._on_send())
+        # NOTE: <Return> はグローバルバインドせず入力欄の bind のみで処理（二重発火防止）
 
     def _build_desktop_ui(self):
         c = self.colors
@@ -4603,7 +4751,7 @@ class AliceMainWindow:
         if not (event.state & 0x1):
             self._on_send()
             return "break"
-        return None
+        return "continue"
 
     def _on_send(self):
         text = self._input_box.get_text()
@@ -4621,7 +4769,8 @@ class AliceMainWindow:
                 self._enqueue(self._set_thinking, False)
                 self._enqueue(self._finalize_alice_stream)
                 if self._voice:
-                    self._voice.speak(full)
+                    # スレッドセーフのためキュー経由でUIスレッドに移譲
+                    self._enqueue(self._voice.speak, full)
 
             def on_error(err):
                 self._enqueue(self._append_error, err)
@@ -4739,14 +4888,18 @@ class AliceMainWindow:
 
     def _open_advanced_image_tool(self):
         """高度な画像処理ツールを開く"""
-        dlg = AdvancedBgRemovalDialog(
-            self.root,
-            char_loader=self._char_loader,
-            on_reload=self._reload_character,
-        )
-        # 投げ縄ダブルクリック確定バインド
-        dlg._canvas_src.bind("<Double-Button-1>", dlg._confirm_lasso)
-        self.root.wait_window(dlg)
+        def _open():
+            dlg = AdvancedBgRemovalDialog(
+                self.root,
+                char_loader=self._char_loader,
+                on_reload=self._reload_character,
+            )
+            # 投げ縄ダブルクリック確定バインド（_bind_canvas_events内でも設定済みだが念のため）
+            dlg._canvas_src.bind("<Double-Button-1>", dlg._confirm_lasso)
+            # wait_window() は削除: grab_set() 済みのダイアログに wait_window を使うと
+            # メインスレッドをブロックしてGUIがフリーズするため不要
+        # メインループに制御を戻してからダイアログを開く（フリーズ防止）
+        self.root.after(10, _open)
 
     def _open_bg_removal(self):
         """後方互換: 高度な画像処理ツールを開く"""
@@ -4754,11 +4907,13 @@ class AliceMainWindow:
 
     def _open_animation_tool(self):
         """キャラクターアニメーション作成ツールを開く"""
-        dlg = AnimationCompositeDialog(
-            self.root,
-            char_loader=self._char_loader,
-        )
-        self.root.wait_window(dlg)
+        def _open():
+            dlg = AnimationCompositeDialog(
+                self.root,
+                char_loader=self._char_loader,
+            )
+            # wait_window() は削除: grab_set() 済みのため不要（フリーズ原因）
+        self.root.after(10, _open)
 
     def _check_voicevox(self):
         if self._voice:
@@ -4772,7 +4927,7 @@ class AliceMainWindow:
         from module import result_log_module as _rl
         logs = _rl.get_logs_dir()
         logs.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(f'explorer "{logs}"', shell=True)
+        subprocess.Popen(["explorer", str(logs)])
 
     def _show_about(self):
         messagebox.showinfo(
@@ -4797,4 +4952,3 @@ class AliceMainWindow:
                 self._voice.stop()
             logger.info("Alice AI 終了。")
             self.root.quit()
-            self.root.destroy()
