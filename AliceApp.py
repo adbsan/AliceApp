@@ -713,11 +713,25 @@ class AliceApp:
         if backend_pref in ("auto", "gemini"):
             ok, client, model_name, startup_notice = self._ensure_gemini_model()
             if ok and client:
+                if backend_pref == "auto" and not startup_notice.get("auto_selected"):
+                    startup_notice = {
+                        "auto_selected": True,
+                        "backend": "gemini",
+                        "model_name": model_name,
+                        "message": f"AI_BACKEND=auto により Gemini を選択しました: {model_name}",
+                    }
                 return True, "gemini", client, model_name, startup_notice
 
         if backend_pref in ("auto", "local"):
             ok, client, model_name, startup_notice = self._ensure_local_model()
             if ok and client:
+                if backend_pref == "auto" and not startup_notice.get("auto_selected"):
+                    startup_notice = {
+                        "auto_selected": True,
+                        "backend": "local",
+                        "model_name": model_name,
+                        "message": f"AI_BACKEND=auto により Local LLM を選択しました: {model_name}",
+                    }
                 return True, "local", client, model_name, startup_notice
 
         logger.error("利用可能なAIバックエンドが見つかりませんでした。")

@@ -4761,6 +4761,7 @@ class AliceMainWindow:
         self._voice_btn: Optional[tk.Button] = None
         self._startup_popup: Optional[tk.Toplevel] = None
         self._startup_popup_after_id: Optional[str] = None
+        self._startup_guard_retries = 16
 
         self.root = tk.Tk()
         self._setup_window()
@@ -4773,8 +4774,22 @@ class AliceMainWindow:
         self.root.mainloop()
 
     def _bootstrap_startup(self) -> None:
+        self._startup_desktop_guard()
         self._ensure_startup_desktop_mode()
         self._show_startup_model_popup_if_needed()
+
+    def _startup_desktop_guard(self) -> None:
+        if self._startup_guard_retries <= 0:
+            return
+        self._startup_guard_retries -= 1
+        self._ensure_startup_desktop_mode()
+        self._ensure_desktop_chat_visible()
+        self._ensure_chat_display_ready()
+        self._ensure_chat_input_ready()
+        try:
+            self.root.after(250, self._startup_desktop_guard)
+        except tk.TclError:
+            return
 
     def _show_startup_model_popup_if_needed(self) -> None:
         info = dict(self._startup_notice or {})
@@ -5100,9 +5115,9 @@ class AliceMainWindow:
             try:
                 if not self._chat_display_container.winfo_manager():
                     if self._input_container is not None and self._widget_exists(self._input_container):
-                        self._chat_display_container.pack(fill="both", expand=True, before=self._input_container)
+                        self._chat_display_container.pack(side="top", fill="both", expand=True, before=self._input_container)
                     else:
-                        self._chat_display_container.pack(fill="both", expand=True)
+                        self._chat_display_container.pack(side="top", fill="both", expand=True)
             except Exception:
                 pass
 
@@ -5122,9 +5137,9 @@ class AliceMainWindow:
             try:
                 if not self._input_container.winfo_manager():
                     if self._chat_display_container is not None and self._widget_exists(self._chat_display_container):
-                        self._input_container.pack(fill="x", after=self._chat_display_container)
+                        self._input_container.pack(side="bottom", fill="x", after=self._chat_display_container)
                     else:
-                        self._input_container.pack(fill="x")
+                        self._input_container.pack(side="bottom", fill="x")
             except Exception:
                 pass
 
@@ -5152,6 +5167,7 @@ class AliceMainWindow:
         if self._mode_var is not None:
             self._mode_var.set(self._mode.value)
         self._apply_current_layout(reset_geometry=False)
+        self._ensure_desktop_chat_visible()
         self._ensure_chat_display_ready()
         self._ensure_chat_input_ready()
         self._schedule_desktop_split_fix()
@@ -5212,7 +5228,8 @@ class AliceMainWindow:
 
     def _build_header(self, parent, c):
         h = tk.Frame(parent, bg=c.bg_secondary, height=52)
-        h.pack(fill="x"); h.pack_propagate(False)
+        h.pack(side="top", fill="x")
+        h.pack_propagate(False)
         name = self._env.get("ALICE_NAME") if self._env else "Alice"
         tk.Label(h, text=f"✦ {name} AI", bg=c.bg_secondary, fg=c.accent_primary,
                  font=("Segoe UI", 15, "bold")).pack(side="left", padx=18, pady=12)
@@ -5230,7 +5247,7 @@ class AliceMainWindow:
             except Exception:
                 pass
         f = tk.Frame(parent, bg=c.bg_primary)
-        f.pack(fill="both", expand=True)
+        f.pack(side="top", fill="both", expand=True)
         self._chat_display_container = f
         sb = ttk.Scrollbar(f, orient="vertical")
         sb.pack(side="right", fill="y")
@@ -5262,8 +5279,16 @@ class AliceMainWindow:
                 self._input_container.destroy()
             except Exception:
                 pass
-        container = tk.Frame(parent, bg=c.bg_secondary, pady=10)
-        container.pack(fill="x")
+        container = tk.Frame(
+            parent,
+            bg=c.bg_secondary,
+            pady=8,
+            highlightthickness=1,
+            highlightbackground=c.border,
+        )
+        container.pack(side="bottom", fill="x")
+        container.pack_propagate(False)
+        container.configure(height=94)
         self._input_container = container
         inner = tk.Frame(container, bg=c.bg_secondary)
         inner.pack(fill="x", padx=12)
