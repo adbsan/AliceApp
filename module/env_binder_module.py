@@ -36,6 +36,20 @@ _ENV_SCHEMA: Dict[str, Dict[str, Any]] = {
     "GOOGLE_API_KEY":         {"type": str,   "default": ""},
     "ALICE_MODEL":            {"type": str,   "default": "gemini-2.0-flash"},
     "ALICE_NAME":             {"type": str,   "default": "Alice"},
+    "AI_BACKEND":             {"type": str,   "default": "auto"},  # auto | gemini | local
+
+    # Local LLM (llama.cpp + GGUF)
+    "LOCAL_MODEL_REPO":       {"type": str,   "default": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"},
+    "LOCAL_MODEL_FILE":       {"type": str,   "default": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"},
+    "LOCAL_MODEL_DIR":        {"type": str,   "default": "assets/models"},
+    "LOCAL_MODEL_N_CTX":      {"type": int,   "default": 2048},
+    "LOCAL_MODEL_MAX_TOKENS": {"type": int,   "default": 256},
+    "LOCAL_MODEL_TEMPERATURE":{"type": float, "default": 0.7},
+    "LOCAL_MODEL_TOP_P":      {"type": float, "default": 0.95},
+    "LOCAL_MODEL_THREADS":    {"type": int,   "default": 0},
+    "LOCAL_MODEL_N_GPU_LAYERS":{"type": int,  "default": 0},
+    "LOCAL_MODEL_CHAT_FORMAT":{"type": str,   "default": ""},
+    "HF_TOKEN":               {"type": str,   "default": ""},
 
     # VOICEVOX
     "VOICEVOX_URL":           {"type": str,   "default": "http://localhost:50021"},

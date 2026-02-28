@@ -4471,6 +4471,7 @@ class SettingsDialog(tk.Toplevel):
         tabs = {
             "Alice":  self._tab_alice,
             "API":    self._tab_api,
+            "Local":  self._tab_local,
             "Voice":  self._tab_voice,
             "表示":   self._tab_appear,
             "Git":    self._tab_git,
@@ -4486,12 +4487,26 @@ class SettingsDialog(tk.Toplevel):
 
     def _tab_alice(self, f, c):
         self._row_str(f, c, "Alice 名前", "ALICE_NAME")
+        self._row_combo(f, c, "AIバックエンド", "AI_BACKEND", ["auto", "gemini", "local"])
         self._row_combo(f, c, "AIモデル", "ALICE_MODEL", self._MODEL_CHOICES)
 
     def _tab_api(self, f, c):
         self._row_str(f, c, "Google API Key", "GOOGLE_API_KEY", show="*")
+        self._row_str(f, c, "Hugging Face Token", "HF_TOKEN", show="*")
         self._row_str(f, c, "VOICEVOX URL", "VOICEVOX_URL")
         self._row_int(f, c, "VOICEVOX Speaker ID", "VOICEVOX_SPEAKER_ID")
+
+    def _tab_local(self, f, c):
+        self._row_str(f, c, "Model Repo", "LOCAL_MODEL_REPO")
+        self._row_str(f, c, "Model File", "LOCAL_MODEL_FILE")
+        self._row_str(f, c, "Model Dir", "LOCAL_MODEL_DIR")
+        self._row_int(f, c, "Context (n_ctx)", "LOCAL_MODEL_N_CTX")
+        self._row_int(f, c, "Max Tokens", "LOCAL_MODEL_MAX_TOKENS")
+        self._row_flt(f, c, "Temperature", "LOCAL_MODEL_TEMPERATURE")
+        self._row_flt(f, c, "Top P", "LOCAL_MODEL_TOP_P")
+        self._row_int(f, c, "Threads (0=auto)", "LOCAL_MODEL_THREADS")
+        self._row_int(f, c, "GPU Layers", "LOCAL_MODEL_N_GPU_LAYERS")
+        self._row_str(f, c, "Chat Format", "LOCAL_MODEL_CHAT_FORMAT")
 
     def _tab_voice(self, f, c):
         self._row_flt(f, c, "速度", "VOICEVOX_SPEED")
@@ -5327,7 +5342,17 @@ class AliceMainWindow:
         SettingsDialog(self.root, self._env, on_save=self._on_settings_saved)
 
     def _on_settings_saved(self):
-        self._update_status("設定を更新しました。")
+        try:
+            from module import neural_loader_module as _neural
+            _neural.reset()
+        except Exception:
+            pass
+        try:
+            from module import local_llm_loader_module as _local
+            _local.reset()
+        except Exception:
+            pass
+        self._update_status("設定を更新しました（次回接続時にAI設定を再初期化します）。")
 
     def _open_git_dialog(self):
         GitDialog(self.root, self._git, self._env)

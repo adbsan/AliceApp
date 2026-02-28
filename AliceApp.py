@@ -19,7 +19,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 ROOT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT_DIR))
@@ -46,10 +46,12 @@ logger.add(
 # モジュールインポート
 # ============================================================
 from module import env_binder_module as env
+from module import local_llm_loader_module as local_loader
 from module import neural_loader_module as neural
 from module import prompt_shaper_module as shaper
 from module import result_log_module as result_log
 from src.AI.heart import AliceHeart
+from src.AI.local_heart import LocalAliceHeart
 
 
 # ============================================================
@@ -59,7 +61,7 @@ from src.AI.heart import AliceHeart
 class AliceEngine:
     """heart.py を呼び出すパイプラインコントローラ。"""
 
-    def __init__(self, heart: AliceHeart) -> None:
+    def __init__(self, heart: Any) -> None:
         self._heart = heart
         self._history: List[shaper.Message] = []
 
@@ -649,7 +651,7 @@ class AliceApp:
     )
 
     def __init__(self) -> None:
-        self._heart:  Optional[AliceHeart]      = None
+        self._heart:  Optional[Any]             = None
         self._engine: Optional[AliceEngine]     = None
         self._voice:  Optional[VoiceEngine]     = None
         self._git:    Optional[GitManager]      = None
@@ -661,10 +663,19 @@ class AliceApp:
         logger.info("=" * 60)
 
         self._load_config()
-        ok, client, model_name = self._ensure_model()
+        ok, backend, client, model_name = self._ensure_model()
 
         if ok and client:
-            self._heart = AliceHeart(client=client, model_name=model_name)
+            if backend == "local":
+                self._heart = LocalAliceHeart(
+                    llm=client,
+                    model_name=model_name,
+                    max_tokens=int(env.get("LOCAL_MODEL_MAX_TOKENS")),
+                    temperature=float(env.get("LOCAL_MODEL_TEMPERATURE")),
+                    top_p=float(env.get("LOCAL_MODEL_TOP_P")),
+                )
+            else:
+                self._heart = AliceHeart(client=client, model_name=model_name)
         else:
             logger.warning("モデルが利用できません。チャット機能は無効化されます。")
 
@@ -686,28 +697,60 @@ class AliceApp:
             logger.warning(".env の読み込みに失敗しました。デフォルト設定で動作します。")
 
     def _ensure_model(self) -> tuple:
-        """load() 内で検証済みのため verify_model() 重複呼び出しは行わない。"""
+        """
+        AIバックエンドを初期化する。
+
+        Returns:
+            (ok, backend, client, model_name)
+            backend: "gemini" | "local" | ""
+        """
+        backend_pref = str(env.get("AI_BACKEND") or "auto").strip().lower()
+        if backend_pref not in ("auto", "gemini", "local"):
+            backend_pref = "auto"
+
+        if backend_pref in ("auto", "gemini"):
+            ok, client, model_name = self._ensure_gemini_model()
+            if ok and client:
+                return True, "gemini", client, model_name
+
+        if backend_pref in ("auto", "local"):
+            ok, client, model_name = self._ensure_local_model()
+            if ok and client:
+                return True, "local", client, model_name
+
+        logger.error("利用可能なAIバックエンドが見つかりませんでした。")
+        return False, "", None, ""
+
+    def _ensure_gemini_model(self) -> tuple:
         ok, client, model_name = neural.load()
         if ok:
-            logger.info(f"モデルロードOK: {model_name}")
+            logger.info(f"Gemini モデルロードOK: {model_name}")
             return True, client, model_name
 
         api_key = str(env.get("GOOGLE_API_KEY") or "").strip()
         if not api_key:
-            logger.error("GOOGLE_API_KEY が未設定のため、AIチャットは無効化されます。")
+            logger.warning("GOOGLE_API_KEY が未設定のため、Gemini接続をスキップします。")
             return False, None, ""
 
         selected = self._auto_select_model(api_key)
         if selected:
-            logger.warning(f"モデルを自動選択しました: {selected}")
+            logger.warning(f"Geminiモデルを自動選択しました: {selected}")
             env.write_key("ALICE_MODEL", selected)
             neural.reset()
             ok2, client2, model_name2 = neural.load()
             if ok2:
-                logger.info(f"モデルロードOK（自動選択）: {model_name2}")
+                logger.info(f"Gemini モデルロードOK（自動選択）: {model_name2}")
                 return True, client2, model_name2
 
-        logger.error("Gemini クライアントのロードに失敗しました。チャット機能は無効化されます。")
+        logger.warning("Gemini クライアントのロードに失敗しました。")
+        return False, None, ""
+
+    def _ensure_local_model(self) -> tuple:
+        ok, llm, model_label = local_loader.load()
+        if ok and llm:
+            logger.info(f"Local モデルロードOK: {model_label}")
+            return True, llm, model_label
+        logger.warning("Local LLM のロードに失敗しました。")
         return False, None, ""
 
     @classmethod

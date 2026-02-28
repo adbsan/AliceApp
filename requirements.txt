@@ -3,6 +3,8 @@
 
 # AI
 google-genai>=0.8.0
+huggingface-hub>=0.24.0
+llama-cpp-python>=0.3.0
 
 # 環境・設定
 python-dotenv>=1.0.0

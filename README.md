@@ -17,6 +17,12 @@ copy .env.example .env
 # .env を編集してAPIキーを設定
 ```
 
+#### ローカルモデルを使う場合（任意）
+- `.env` で `AI_BACKEND=local` または `AI_BACKEND=auto` を設定
+- `LOCAL_MODEL_REPO` / `LOCAL_MODEL_FILE` を指定
+- 起動時に Hugging Face から GGUF をダウンロードして利用
+- 既定値は TinyLlama GGUF（`TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`）
+
 ### 3. キャラクター画像の配置
 ```
 assets/images/alice_default.png   ... 全身立ち絵（必須）
@@ -83,6 +89,12 @@ AliceApp/
 - 現状ではキャラクターではなく画像に対してアニメーションが付与されている。
 
 ## 更新履歴
+- 2026-03-01 02:55:01 JST
+  - ローカル学習済みモデル（GGUF）をWeb（Hugging Face）から自動DLして利用する機能を追加
+  - `AI_BACKEND`（auto/gemini/local）を追加し、Gemini失敗時のローカルLLMフォールバックを実装
+  - Local LLM 推論クラス (`src/AI/local_heart.py`) を追加し、既存チャットUIからそのまま対話可能に拡張
+  - 設定画面に `AIバックエンド` と `Local` タブを追加（Repo/File/Dir/Context/Token等を編集可能）
+  - 設定保存時に Gemini/Local ローダーのキャッシュをリセットする処理を追加
 - 2026-03-01 02:46:30 JST
   - 起動時にデスクトップモードを強制適用し、初回表示からチャット欄が見えるように修正
   - デスクトップモード復帰時にチャットペイン分割を再補正する処理を追加（入力欄欠落の再発防止）
