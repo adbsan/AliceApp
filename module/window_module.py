@@ -35,11 +35,15 @@ Alice AI メインGUIウィンドウ。
 from __future__ import annotations
 
 import math
+import os
 import queue
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -1873,6 +1877,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
 
         # バッチ処理結果
         self._batch_results: Dict[str, Image.Image] = {}
+        self._batch_placeholders: Dict[str, Image.Image] = {}
+        self._batch_expected_names: List[str] = []
+        self._batch_placeholder_names: set[str] = set()
 
         # _build_toolbar() → _select_tool() より前に必要な Tk 変数
         self._coord_var     = tk.StringVar(value="X:- Y:-")
@@ -2843,6 +2850,9 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
             self._work_arr  = np.array(img) if _NUMPY_AVAILABLE else None
             self._history_stack.clear()
             self._batch_results.clear()
+            self._batch_placeholders.clear()
+            self._batch_expected_names = []
+            self._batch_placeholder_names.clear()
             if hasattr(self, "_batch_listbox"):
                 self._batch_listbox.delete(0, "end")
             if hasattr(self, "_save_btn"):
@@ -2910,6 +2920,45 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         # スライダーを左端から右へ流すアニメーション
         self._play_reveal_animation(duration_ms=900, fps=60)
 
+    def _make_missing_cell_placeholder(self, name: str, size: int = 512) -> "Image.Image":
+        """未設定セル用のプレースホルダー画像を生成する。"""
+        img = Image.new("RGBA", (size, size), (28, 30, 52, 255))
+        draw = ImageDraw.Draw(img)
+        block = max(16, size // 12)
+
+        for y in range(0, size, block):
+            for x in range(0, size, block):
+                if ((x // block) + (y // block)) % 2:
+                    draw.rectangle([x, y, x + block, y + block], fill=(42, 45, 75, 255))
+
+        draw.rectangle([6, 6, size - 6, size - 6], outline=(110, 120, 170, 255), width=2)
+        text = f"{name}\nNO IMAGE"
+        try:
+            bbox = draw.multiline_textbbox((0, 0), text, align="center")
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = (size - tw) // 2
+            ty = (size - th) // 2
+            draw.multiline_text(
+                (tx, ty),
+                text,
+                fill=(240, 240, 255, 255),
+                align="center",
+            )
+        except Exception:
+            draw.multiline_text(
+                (size // 2, size // 2),
+                text,
+                fill=(240, 240, 255, 255),
+                align="center",
+                anchor="mm",
+            )
+        return img
+
+    @staticmethod
+    def _batch_key_from_list_label(label: str) -> str:
+        return label.replace("  [placeholder]", "", 1)
+
     def _run_batch_process(self):
         if self._src_image is None:
             self._set_status("シート画像を開いてください", error=True)
@@ -2924,11 +2973,16 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         cols = self._sheet_cols.get()
         total = rows * cols
         pose_names = [f"cell_{i:02d}" for i in range(total)]
+        self._batch_expected_names = pose_names
+        self._batch_placeholder_names.clear()
+        self._batch_placeholders.clear()
 
         self._processing = True
         self._progress.start(10)
         self._set_status(f"一括処理中... (全{total}セル)")
         self._batch_listbox.delete(0, "end")
+        if hasattr(self, "_save_batch_btn"):
+            self._save_batch_btn.configure(state="disabled")
 
         def _run():
             def on_prog(current, total, msg):
@@ -2940,23 +2994,44 @@ class AdvancedBgRemovalDialog(tk.Toplevel):
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_batch_done(self, results: Dict[str, Image.Image]):
-        self._batch_results = results
+        merged: Dict[str, Image.Image] = {}
+        missing_names: List[str] = []
+        expected_names = self._batch_expected_names or list(results.keys())
+
+        for name in expected_names:
+            img = results.get(name)
+            if img is None and _PIL_AVAILABLE:
+                img = self._make_missing_cell_placeholder(name)
+                self._batch_placeholders[name] = img
+                self._batch_placeholder_names.add(name)
+                missing_names.append(name)
+            if img is not None:
+                merged[name] = img
+
+        self._batch_results = merged
         if hasattr(self, "_progress"):
             self._progress.stop()
         self._processing = False
         if hasattr(self, "_batch_listbox"):
             self._batch_listbox.delete(0, "end")
-        for name in results.keys():
-            self._batch_listbox.insert("end", name)
-        if results:
+        for name in self._batch_results.keys():
+            label = f"{name}  [placeholder]" if name in self._batch_placeholder_names else name
+            self._batch_listbox.insert("end", label)
+        if self._batch_results:
             self._save_batch_btn.configure(state="normal")
-        self._set_status(f"一括処理完了: {len(results)} セル")
+        if missing_names:
+            self._set_status(
+                f"一括処理完了: {len(self._batch_results)} セル "
+                f"(プレースホルダー補完 {len(missing_names)} セル)"
+            )
+        else:
+            self._set_status(f"一括処理完了: {len(self._batch_results)} セル")
 
     def _on_batch_select(self, event):
         sel = self._batch_listbox.curselection()
         if not sel:
             return
-        name = self._batch_listbox.get(sel[0])
+        name = self._batch_key_from_list_label(self._batch_listbox.get(sel[0]))
         img  = self._batch_results.get(name)
         if img is not None and _NUMPY_AVAILABLE:
             self._push_history()
@@ -3517,6 +3592,11 @@ class AnimationCompositeDialog(tk.Toplevel):
         self._canvas_h = 512
 
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
+        self._preview_scale = 1.0
+        self._preview_origin: Tuple[int, int] = (0, 0)
+        self._drag_layer_idx: Optional[int] = None
+        self._drag_mouse_origin: Tuple[int, int] = (0, 0)
+        self._drag_layer_origin: Tuple[int, int] = (0, 0)
 
         self._setup_theme()
         self.title("キャラクターアニメーション作成 - Alice AI")
@@ -3655,6 +3735,16 @@ class AnimationCompositeDialog(tk.Toplevel):
                 self.after_cancel(self._refresh_composite_job)
             self._refresh_composite_job = self.after(80, self._refresh_composite)
         self._composite_canvas.bind("<Configure>", _on_composite_configure)
+        self._composite_canvas.bind("<ButtonPress-1>", self._on_composite_press)
+        self._composite_canvas.bind("<B1-Motion>", self._on_composite_drag)
+        self._composite_canvas.bind("<ButtonRelease-1>", self._on_composite_release)
+        tk.Label(
+            ca,
+            text="左ドラッグでレイヤー移動",
+            bg=c.bg_primary,
+            fg=c.text_muted,
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", padx=4, pady=(0, 4))
 
     def _build_right_panel(self, parent, c):
         """右: フレーム管理・書き出し"""
@@ -3891,6 +3981,100 @@ class AnimationCompositeDialog(tk.Toplevel):
     def _update_layer_info(self):
         self._layer_info_var.set(f"レイヤー: {len(self._layers)}")
 
+    def _select_layer_index(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._layers):
+            return
+        self._selected_layer = idx
+        self._layer_listbox.selection_clear(0, "end")
+        self._layer_listbox.selection_set(idx)
+        self._layer_listbox.activate(idx)
+        layer = self._layers[idx]
+        self._prop_x.set(layer["x"])
+        self._prop_y.set(layer["y"])
+        self._prop_scale.set(layer["scale"])
+        self._prop_alpha.set(layer["alpha"])
+
+    def _canvas_to_composite_coords(self, cx: int, cy: int) -> Optional[Tuple[int, int]]:
+        scale = max(self._preview_scale, 1e-6)
+        ox, oy = self._preview_origin
+        ix = int((cx - ox) / scale)
+        iy = int((cy - oy) / scale)
+        if 0 <= ix < self._canvas_w and 0 <= iy < self._canvas_h:
+            return ix, iy
+        return None
+
+    def _pick_layer_at(self, ix: int, iy: int) -> Optional[int]:
+        for idx in range(len(self._layers) - 1, -1, -1):
+            layer = self._layers[idx]
+            if not layer.get("visible", True):
+                continue
+            base_img = layer["img"]
+            scale = float(layer["scale"])
+            lw = max(1, int(base_img.width * scale))
+            lh = max(1, int(base_img.height * scale))
+            lx = int(layer["x"])
+            ly = int(layer["y"])
+            if not (lx <= ix < lx + lw and ly <= iy < ly + lh):
+                continue
+
+            local_x = int((ix - lx) / max(scale, 1e-6))
+            local_y = int((iy - ly) / max(scale, 1e-6))
+            local_x = max(0, min(base_img.width - 1, local_x))
+            local_y = max(0, min(base_img.height - 1, local_y))
+            try:
+                if base_img.getchannel("A").getpixel((local_x, local_y)) <= 5:
+                    continue
+            except Exception:
+                pass
+            return idx
+        return None
+
+    def _on_composite_press(self, event):
+        pos = self._canvas_to_composite_coords(event.x, event.y)
+        if pos is None:
+            self._drag_layer_idx = None
+            return
+        hit_idx = self._pick_layer_at(*pos)
+        if hit_idx is None:
+            self._drag_layer_idx = None
+            return
+
+        self._select_layer_index(hit_idx)
+        self._drag_layer_idx = hit_idx
+        self._drag_mouse_origin = (event.x, event.y)
+        layer = self._layers[hit_idx]
+        self._drag_layer_origin = (int(layer["x"]), int(layer["y"]))
+        self._composite_canvas.configure(cursor="fleur")
+
+    def _on_composite_drag(self, event):
+        if self._drag_layer_idx is None:
+            return
+        if self._drag_layer_idx >= len(self._layers):
+            self._drag_layer_idx = None
+            return
+
+        scale = max(self._preview_scale, 1e-6)
+        dx = int(round((event.x - self._drag_mouse_origin[0]) / scale))
+        dy = int(round((event.y - self._drag_mouse_origin[1]) / scale))
+        new_x = self._drag_layer_origin[0] + dx
+        new_y = self._drag_layer_origin[1] + dy
+
+        layer = self._layers[self._drag_layer_idx]
+        if layer["x"] == new_x and layer["y"] == new_y:
+            return
+        layer["x"] = new_x
+        layer["y"] = new_y
+        if self._selected_layer == self._drag_layer_idx:
+            self._prop_x.set(new_x)
+            self._prop_y.set(new_y)
+        self._refresh_composite()
+
+    def _on_composite_release(self, _event):
+        if self._drag_layer_idx is not None:
+            self._anim_status_var.set("ドラッグでレイヤー位置を更新しました")
+        self._drag_layer_idx = None
+        self._composite_canvas.configure(cursor="fleur")
+
     # ================================================================
     # Inpaint統合
     # ================================================================
@@ -4014,11 +4198,28 @@ class AnimationCompositeDialog(tk.Toplevel):
         nh    = max(1, int(img.height * scale))
         x     = (cw - nw) // 2
         y     = (ch - nh) // 2
+        self._preview_scale = scale
+        self._preview_origin = (x, y)
         resized = img.resize((nw, nh), Image.LANCZOS)
         bg.paste(resized, (x, y), resized)
         self._tk_preview = ImageTk.PhotoImage(bg)
         canvas.delete("all")
         canvas.create_image(0, 0, anchor="nw", image=self._tk_preview)
+        if not self._layers:
+            canvas.create_text(
+                cw // 2,
+                ch // 2 - 10,
+                text="画像未設定",
+                fill="#d8dcff",
+                font=("Segoe UI", 16, "bold"),
+            )
+            canvas.create_text(
+                cw // 2,
+                ch // 2 + 18,
+                text="「+ 画像」または「+ キャラ」で追加",
+                fill="#9aa3c6",
+                font=("Segoe UI", 10),
+            )
 
     def _apply_canvas_size(self):
         sz_str = self._canvas_size_var.get()
@@ -4494,6 +4695,10 @@ class AliceMainWindow:
 
         self._msg_queue: queue.Queue = queue.Queue(maxsize=500)
         self._streaming_started = False
+        self._mode_var: Optional[tk.StringVar] = None
+        self._statusbar_frame: Optional[tk.Frame] = None
+        self._chat_frame: Optional[tk.Frame] = None
+        self._char_frame: Optional[tk.Frame] = None
 
         self.root = tk.Tk()
         self._setup_window()
@@ -4531,7 +4736,11 @@ class AliceMainWindow:
         self.root.configure(bg=c.bg_primary)
         self.root.geometry(f"{layout.default_width}x{layout.default_height}")
         self.root.minsize(layout.min_width, layout.min_height)
-        self.root.resizable(True, True)
+        self.root.resizable(layout.resizable, layout.resizable)
+        try:
+            self.root.attributes("-topmost", bool(layout.always_on_top))
+        except Exception:
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
@@ -4557,6 +4766,21 @@ class AliceMainWindow:
 
         vm = menu(menubar)
         vm.add_command(label="チャット履歴をクリア", command=self._clear_chat)
+        vm.add_separator()
+        self._mode_var = tk.StringVar(value=self._mode.value)
+        vm.add_radiobutton(
+            label="デスクトップモード",
+            value=AppMode.DESKTOP.value,
+            variable=self._mode_var,
+            command=lambda: self._set_mode(AppMode.DESKTOP),
+        )
+        vm.add_radiobutton(
+            label="キャラクターモード",
+            value=AppMode.CHARACTER.value,
+            variable=self._mode_var,
+            command=lambda: self._set_mode(AppMode.CHARACTER),
+        )
+        vm.add_command(label="モード切替 (Ctrl+M)", command=self._toggle_mode)
         menubar.add_cascade(label="表示", menu=vm)
 
         gm = menu(menubar)
@@ -4580,28 +4804,30 @@ class AliceMainWindow:
         menubar.add_cascade(label="ヘルプ", menu=hm)
 
         self.root.bind("<Control-comma>", lambda e: self._open_settings())
+        self.root.bind("<Control-m>", lambda e: self._toggle_mode())
         # NOTE: <Return> はグローバルバインドせず入力欄の bind のみで処理（二重発火防止）
 
     def _build_desktop_ui(self):
         c = self.colors
-        layout = get_layout(AppMode.DESKTOP)
+        layout = get_layout(self._mode)
 
         self._paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self._paned.pack(fill="both", expand=True)
 
-        chat_frame = tk.Frame(self._paned, bg=c.bg_primary)
-        self._paned.add(chat_frame, weight=62)
+        self._chat_frame = tk.Frame(self._paned, bg=c.bg_primary)
+        self._paned.add(self._chat_frame, weight=62)
 
-        self._build_header(chat_frame, c)
-        self._build_chat_display(chat_frame, c)
-        self._build_input_area(chat_frame, c)
+        self._build_header(self._chat_frame, c)
+        self._build_chat_display(self._chat_frame, c)
+        self._build_input_area(self._chat_frame, c)
 
-        char_frame = tk.Frame(self._paned, bg=c.bg_secondary)
-        self._paned.add(char_frame, weight=38)
+        self._char_frame = tk.Frame(self._paned, bg=c.bg_secondary)
+        self._paned.add(self._char_frame, weight=38)
 
-        self._build_character_panel(char_frame, c, layout)
+        self._build_character_panel(self._char_frame, c, layout)
         self.root.after(50, self._set_initial_sash)
         self._build_status_bar(c)
+        self._apply_current_layout(reset_geometry=False)
 
     def _set_initial_sash(self):
         try:
@@ -4610,6 +4836,56 @@ class AliceMainWindow:
                 self._paned.sashpos(0, int(total * self._CHAT_RATIO))
         except Exception:
             pass
+
+    def _toggle_mode(self):
+        next_mode = AppMode.CHARACTER if self._mode == AppMode.DESKTOP else AppMode.DESKTOP
+        self._set_mode(next_mode)
+
+    def _set_mode(self, mode: AppMode):
+        if mode == self._mode:
+            if self._mode_var is not None:
+                self._mode_var.set(self._mode.value)
+            return
+        self._mode = mode
+        self._apply_current_layout(reset_geometry=True)
+        if self._char_loader:
+            self._load_character()
+
+    def _apply_current_layout(self, reset_geometry: bool = True):
+        layout = get_layout(self._mode)
+
+        if reset_geometry:
+            self.root.geometry(f"{layout.default_width}x{layout.default_height}")
+        self.root.minsize(layout.min_width, layout.min_height)
+        self.root.resizable(layout.resizable, layout.resizable)
+        try:
+            self.root.attributes("-topmost", bool(layout.always_on_top))
+        except Exception:
+            pass
+
+        if hasattr(self, "_paned") and self._chat_frame is not None and self._char_frame is not None:
+            for pane in list(self._paned.panes()):
+                self._paned.forget(pane)
+            if layout.show_chat_panel:
+                self._paned.add(self._chat_frame, weight=62)
+            if layout.show_character:
+                self._paned.add(self._char_frame, weight=100 if not layout.show_chat_panel else 38)
+            if layout.show_chat_panel and layout.show_character:
+                self.root.after(20, self._set_initial_sash)
+
+        if self._statusbar_frame is not None:
+            if layout.show_status_bar:
+                if not self._statusbar_frame.winfo_manager():
+                    self._statusbar_frame.pack(fill="x", side="bottom")
+                    self._statusbar_frame.pack_propagate(False)
+            else:
+                if self._statusbar_frame.winfo_manager():
+                    self._statusbar_frame.pack_forget()
+
+        if self._mode_var is not None:
+            self._mode_var.set(self._mode.value)
+        mode_text = "キャラクターモード" if self._mode == AppMode.CHARACTER else "デスクトップモード"
+        self._update_status(f"{mode_text} に切り替えました。")
 
     def _build_header(self, parent, c):
         h = tk.Frame(parent, bg=c.bg_secondary, height=52)
@@ -4704,7 +4980,9 @@ class AliceMainWindow:
 
     def _build_status_bar(self, c):
         bar = tk.Frame(self.root, bg=c.bg_secondary, height=26)
-        bar.pack(fill="x", side="bottom"); bar.pack_propagate(False)
+        bar.pack(fill="x", side="bottom")
+        bar.pack_propagate(False)
+        self._statusbar_frame = bar
         self._statusbar = tk.Label(bar, text="Alice AI Ready", bg=c.bg_secondary,
                                    fg=c.text_muted, font=("Segoe UI", 9), anchor="w")
         self._statusbar.pack(side="left", padx=12, pady=4)
@@ -4802,7 +5080,8 @@ class AliceMainWindow:
             self._status_label.configure(text="考え中..." if thinking else "Ready")
 
     def _toggle_voice(self):
-        if self._voice and self._voice.is_speaking:
+        has_pending = bool(getattr(self._voice, "has_pending_speech", False)) if self._voice else False
+        if self._voice and (self._voice.is_speaking or has_pending):
             self._voice.stop()
             self._voice_btn.configure(text="音声")
         elif self._voice:
@@ -4923,11 +5202,82 @@ class AliceMainWindow:
         else:
             messagebox.showwarning("VOICEVOX", "VoiceEngine が初期化されていません。")
 
+    @staticmethod
+    def _is_android_platform() -> bool:
+        return hasattr(sys, "getandroidapilevel") or bool(os.environ.get("ANDROID_ROOT"))
+
+    @staticmethod
+    def _is_ios_platform() -> bool:
+        return (
+            sys.platform == "ios"
+            or bool(os.environ.get("PYTHONISTA_VERSION"))
+            or bool(os.environ.get("PYTO_VERSION"))
+        )
+
+    def _open_path_cross_platform(self, target: Path) -> bool:
+        target = target.resolve()
+        target_str = str(target)
+        target_uri = target.as_uri()
+
+        if self._is_ios_platform():
+            try:
+                return bool(webbrowser.open(target_uri))
+            except Exception as e:
+                logger.warning(f"iOS open 失敗: {e}")
+
+        if sys.platform.startswith("win"):
+            try:
+                os.startfile(target_str)  # type: ignore[attr-defined]
+                return True
+            except Exception as e:
+                logger.warning(f"Windows open 失敗: {e}")
+
+        commands: List[List[str]] = []
+        if self._is_android_platform():
+            commands.extend([
+                ["termux-open", target_str],
+                ["termux-open-url", target_uri],
+                ["am", "start", "-a", "android.intent.action.VIEW", "-d", target_uri],
+                ["xdg-open", target_str],
+            ])
+        elif sys.platform == "darwin":
+            commands.append(["open", target_str])
+        else:
+            commands.extend([
+                ["xdg-open", target_str],
+                ["gio", "open", target_str],
+                ["kioclient5", "exec", target_str],
+                ["kde-open5", target_str],
+            ])
+
+        for cmd in commands:
+            exe = cmd[0]
+            if shutil.which(exe) is None:
+                continue
+            try:
+                subprocess.Popen(cmd)
+                return True
+            except Exception as e:
+                logger.warning(f"'{exe}' でのフォルダ起動失敗: {e}")
+
+        try:
+            return bool(webbrowser.open(target_uri))
+        except Exception as e:
+            logger.warning(f"webbrowser フォールバック失敗: {e}")
+            return False
+
     def _open_logs(self):
         from module import result_log_module as _rl
         logs = _rl.get_logs_dir()
         logs.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["explorer", str(logs)])
+        if self._open_path_cross_platform(logs):
+            self._update_status("ログフォルダを開きました。")
+            return
+        messagebox.showinfo(
+            "ログフォルダ",
+            f"自動で開けませんでした。手動で開いてください:\n{logs}",
+        )
+        self._update_status(f"ログフォルダ: {logs}")
 
     def _show_about(self):
         messagebox.showinfo(

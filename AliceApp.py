@@ -14,6 +14,7 @@ AliceApp.py
 from __future__ import annotations
 
 import re
+import queue
 import sys
 import threading
 from datetime import datetime
@@ -317,6 +318,7 @@ class VoiceEngine:
         self._is_speaking = False
         self._stop_flag = False
         self._lock = threading.Lock()
+        self._speech_queue: "queue.Queue[str]" = queue.Queue(maxsize=30)
         self._voicevox_url = env.get("VOICEVOX_URL")
         self._speaker_id   = int(env.get("VOICEVOX_SPEAKER_ID"))
         self._speed        = float(env.get("VOICEVOX_SPEED"))
@@ -346,9 +348,16 @@ class VoiceEngine:
                 self._pygame_available = False
                 logger.warning(f"pygame mixer 初期化失敗: {e} → winsound にフォールバックします。")
 
+        self._speech_worker_thread = threading.Thread(target=self._speech_worker, daemon=True)
+        self._speech_worker_thread.start()
+
     @property
     def is_speaking(self) -> bool:
         return self._is_speaking
+
+    @property
+    def has_pending_speech(self) -> bool:
+        return self._is_speaking or (not self._speech_queue.empty())
 
     def speak(self, text: str) -> None:
         if not self._requests_available:
@@ -356,7 +365,7 @@ class VoiceEngine:
         cleaned = self._clean_text(text)
         if not cleaned.strip():
             return
-        threading.Thread(target=self._speak_thread, args=(cleaned,), daemon=True).start()
+        self._enqueue_speech(cleaned)
 
     def _clean_text(self, text: str) -> str:
         result = text
@@ -379,8 +388,43 @@ class VoiceEngine:
             finally:
                 self._is_speaking = False
 
+    def _enqueue_speech(self, text: str) -> None:
+        try:
+            self._speech_queue.put_nowait(text)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self._speech_queue.get_nowait()
+            logger.warning("音声キューが満杯のため古い発話を破棄しました。")
+        except queue.Empty:
+            pass
+
+        try:
+            self._speech_queue.put_nowait(text)
+        except queue.Full:
+            logger.warning("音声キューが満杯のため発話を破棄しました。")
+
+    def _clear_speech_queue(self) -> None:
+        while True:
+            try:
+                self._speech_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _speech_worker(self) -> None:
+        while True:
+            text = self._speech_queue.get()
+            try:
+                if text:
+                    self._speak_thread(text)
+            except Exception as e:
+                logger.error(f"音声キューワーカーエラー: {e}")
+
     def stop(self) -> None:
         self._stop_flag = True
+        self._clear_speech_queue()
         if self._pygame_available:
             try:
                 import pygame
