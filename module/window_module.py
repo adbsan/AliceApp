@@ -26,7 +26,7 @@ Alice AI メインGUIウィンドウ。
   - グローバル <Return> バインド削除（二重発火防止）。
   - _voice.speak() をキュー経由に変更（スレッドセーフ化）。
   - 遅延構築ウィジェットへの hasattr() ガード追加。
-  - CharacterAnimator._loop(): TclError 以外の例外もキャッチしてログ出力。
+  - CharacterAnimator._tick(): 例外時に安全停止してGUIイベント滞留を回避。
   - np.random.choice → np.random.default_rng().choice()（ローカル乱数化）。
   - _run_inpaint: スナップショット先取りでスレッド競合を修正。
   - queue.Queue(maxsize=500) + _enqueue にドロップ戦略を追加。
@@ -208,18 +208,20 @@ class CharacterAnimator:
         self._image_id: Optional[int] = None
         self._state = CharacterState.IDLE
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._after_id: Optional[str] = None
         self._start_time = time.time()
         self._fps = DEFAULT_ANIMATION.fps
 
         # v3: リサイズキャッシュ
         self._cached_resized_img: Optional[Image.Image] = None
+        self._cached_tk_img: Optional[ImageTk.PhotoImage] = None
         self._last_canvas_size: Tuple[int, int] = (0, 0)
         self._last_state: Optional[CharacterState] = None
 
     def load_images(self, images: Dict[str, Optional[Image.Image]]) -> None:
         self._images = {k: v for k, v in images.items() if v is not None}
         self._cached_resized_img = None
+        self._cached_tk_img = None
         self._last_canvas_size = (0, 0)
         self._last_state = None
         logger.info(f"CharacterAnimator: {len(self._images)} 枚の画像をロードしました。")
@@ -232,24 +234,43 @@ class CharacterAnimator:
             return
         self._running = True
         self._start_time = time.time()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self._schedule_next_frame(0)
 
     def stop(self) -> None:
         self._running = False
-
-    def _loop(self) -> None:
-        interval = 1.0 / max(1, self._fps)
-        while self._running:
-            t = time.time() - self._start_time
+        if self._after_id is not None:
             try:
-                self.canvas.after_idle(self._render, t)
-            except tk.TclError:
-                break
-            except Exception as e:
-                logger.error(f"CharacterAnimator._loop 予期しないエラー: {e}")
-                break
-            time.sleep(interval)
+                self.canvas.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _schedule_next_frame(self, delay_ms: Optional[int] = None) -> None:
+        if not self._running:
+            return
+        if delay_ms is None:
+            delay_ms = max(1, int(1000 / max(1, self._fps)))
+        try:
+            self._after_id = self.canvas.after(delay_ms, self._tick)
+        except tk.TclError:
+            self._running = False
+            self._after_id = None
+
+    def _tick(self) -> None:
+        self._after_id = None
+        if not self._running:
+            return
+        t = time.time() - self._start_time
+        try:
+            self._render(t)
+        except tk.TclError:
+            self._running = False
+            return
+        except Exception as e:
+            logger.error(f"CharacterAnimator._tick 予期しないエラー: {e}")
+            self._running = False
+            return
+        self._schedule_next_frame()
 
     def _render(self, t: float) -> None:
         if not _PIL_AVAILABLE or not self._images:
@@ -276,11 +297,14 @@ class CharacterAnimator:
                 nw = max(1, int(img.width * ratio))
                 nh = max(1, int(img.height * ratio))
                 self._cached_resized_img = img.resize((nw, nh), Image.LANCZOS)
+                self._cached_tk_img = ImageTk.PhotoImage(self._cached_resized_img)
                 self._last_canvas_size = (cw, ch)
                 self._last_state = self._state
 
             if not self._cached_resized_img:
                 return
+            if self._cached_tk_img is None:
+                self._cached_tk_img = ImageTk.PhotoImage(self._cached_resized_img)
 
             resized = self._cached_resized_img
             nw, nh = resized.width, resized.height
@@ -296,7 +320,7 @@ class CharacterAnimator:
             x = (cw - nw) // 2
             y = (ch - nh) // 2 + offset_y
 
-            self._tk_image = ImageTk.PhotoImage(resized)
+            self._tk_image = self._cached_tk_img
             if self._image_id:
                 self.canvas.coords(self._image_id, x, y)
                 self.canvas.itemconfig(self._image_id, image=self._tk_image)
@@ -4411,6 +4435,13 @@ class AnimationCompositeDialog(tk.Toplevel):
 
 
 class SettingsDialog(tk.Toplevel):
+    _MODEL_CHOICES = [
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
+
     def __init__(self, parent, env_binder, on_save: Optional[Callable] = None):
         super().__init__(parent)
         self._env = env_binder
@@ -4455,7 +4486,7 @@ class SettingsDialog(tk.Toplevel):
 
     def _tab_alice(self, f, c):
         self._row_str(f, c, "Alice 名前", "ALICE_NAME")
-        self._row_str(f, c, "AIモデル", "ALICE_MODEL")
+        self._row_combo(f, c, "AIモデル", "ALICE_MODEL", self._MODEL_CHOICES)
 
     def _tab_api(self, f, c):
         self._row_str(f, c, "Google API Key", "GOOGLE_API_KEY", show="*")
@@ -4674,6 +4705,7 @@ class AliceMainWindow:
 
     _CHAT_RATIO = 0.62
     _CHAR_RATIO = 0.38
+    _DESKTOP_CHAT_MIN_WIDTH = 360
 
     def __init__(
         self,
@@ -4695,14 +4727,21 @@ class AliceMainWindow:
 
         self._msg_queue: queue.Queue = queue.Queue(maxsize=500)
         self._streaming_started = False
+        self._stream_chunk_lock = threading.Lock()
+        self._stream_chunk_buffer: str = ""
+        self._stream_chunk_flush_pending = False
+        self._queue_tick_budget_ms = 12
+        self._queue_tick_max_items = 80
         self._mode_var: Optional[tk.StringVar] = None
         self._statusbar_frame: Optional[tk.Frame] = None
         self._chat_frame: Optional[tk.Frame] = None
         self._char_frame: Optional[tk.Frame] = None
+        self._input_container: Optional[tk.Frame] = None
 
         self.root = tk.Tk()
         self._setup_window()
         self._build_ui()
+        self.root.after(0, self._ensure_startup_desktop_mode)
         self._start_services()
 
     def run(self) -> None:
@@ -4720,14 +4759,57 @@ class AliceMainWindow:
             except (queue.Empty, queue.Full):
                 logger.warning("_enqueue: キューが満杯のためメッセージをドロップしました")
 
+    def _enqueue_stream_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
+        should_schedule = False
+        with self._stream_chunk_lock:
+            self._stream_chunk_buffer += chunk
+            if not self._stream_chunk_flush_pending:
+                self._stream_chunk_flush_pending = True
+                should_schedule = True
+        if should_schedule:
+            self._enqueue(self._flush_stream_chunks)
+
+    def _flush_stream_chunks(self) -> None:
+        with self._stream_chunk_lock:
+            chunk = self._stream_chunk_buffer
+            self._stream_chunk_buffer = ""
+            self._stream_chunk_flush_pending = False
+        if chunk:
+            self._append_alice_chunk(chunk)
+
+    def _finalize_stream_with_fallback(self, full: str) -> None:
+        if self._streaming_started:
+            self._finalize_alice_stream()
+            return
+        text = (full or "").strip()
+        if text:
+            self._append_alice(text)
+
     def _process_queue(self):
-        try:
-            while True:
+        start = time.monotonic()
+        budget_sec = self._queue_tick_budget_ms / 1000.0
+        processed = 0
+
+        while processed < self._queue_tick_max_items:
+            if (time.monotonic() - start) >= budget_sec:
+                break
+            try:
                 fn, args, kwargs = self._msg_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
                 fn(*args, **kwargs)
-        except queue.Empty:
+            except Exception as e:
+                logger.exception(f"_process_queue 実行エラー: {e}")
+            processed += 1
+
+        delay_ms = 5 if not self._msg_queue.empty() else 50
+        try:
+            self.root.after(delay_ms, self._process_queue)
+        except tk.TclError:
             pass
-        self.root.after(50, self._process_queue)
 
     def _setup_window(self):
         layout = get_layout(self._mode)
@@ -4754,53 +4836,62 @@ class AliceMainWindow:
             return tk.Menu(parent, tearoff=0, bg=c.bg_secondary, fg=c.text_primary,
                            activebackground=c.accent_primary, relief="flat")
 
+        def defer_menu_action(fn, *args, **kwargs):
+            # メニューのコールバック中に重いUI処理を直接走らせず、メニュー終了後に実行する。
+            def _run():
+                try:
+                    self.root.after(10, lambda: fn(*args, **kwargs))
+                except tk.TclError:
+                    pass
+            return _run
+
         menubar = tk.Menu(self.root, bg=c.bg_secondary, fg=c.text_primary,
                           activebackground=c.accent_primary, relief="flat")
         self.root.configure(menu=menubar)
 
         fm = menu(menubar)
-        fm.add_command(label="設定", command=self._open_settings, accelerator="Ctrl+,")
+        fm.add_command(label="設定", command=defer_menu_action(self._open_settings), accelerator="Ctrl+,")
         fm.add_separator()
-        fm.add_command(label="終了", command=self._on_close)
+        fm.add_command(label="終了", command=defer_menu_action(self._on_close))
         menubar.add_cascade(label="ファイル", menu=fm)
 
         vm = menu(menubar)
-        vm.add_command(label="チャット履歴をクリア", command=self._clear_chat)
+        vm.add_command(label="チャット履歴をクリア", command=defer_menu_action(self._clear_chat))
         vm.add_separator()
         self._mode_var = tk.StringVar(value=self._mode.value)
         vm.add_radiobutton(
             label="デスクトップモード",
             value=AppMode.DESKTOP.value,
             variable=self._mode_var,
-            command=lambda: self._set_mode(AppMode.DESKTOP),
+            command=defer_menu_action(self._set_mode, AppMode.DESKTOP),
         )
         vm.add_radiobutton(
             label="キャラクターモード",
             value=AppMode.CHARACTER.value,
             variable=self._mode_var,
-            command=lambda: self._set_mode(AppMode.CHARACTER),
+            command=defer_menu_action(self._set_mode, AppMode.CHARACTER),
         )
-        vm.add_command(label="モード切替 (Ctrl+M)", command=self._toggle_mode)
+        vm.add_command(label="モード切替 (Ctrl+M)", command=defer_menu_action(self._toggle_mode))
         menubar.add_cascade(label="表示", menu=vm)
 
         gm = menu(menubar)
-        gm.add_command(label="Git マネージャー", command=self._open_git_dialog)
-        gm.add_command(label="クイックコミット",  command=self._quick_commit)
-        gm.add_command(label="ブランチ切替...",   command=self._switch_branch_dialog)
+        gm.add_command(label="Git マネージャー", command=defer_menu_action(self._open_git_dialog))
+        gm.add_command(label="クイックコミット",  command=defer_menu_action(self._quick_commit))
+        gm.add_command(label="ブランチ切替...",   command=defer_menu_action(self._switch_branch_dialog))
         menubar.add_cascade(label="Git", menu=gm)
 
         tm = menu(menubar)
-        tm.add_command(label="キャラクター再読み込み", command=self._reload_character)
-        tm.add_command(label="🎨 高度な画像処理ツール", command=self._open_advanced_image_tool)
-        tm.add_command(label="🎬 アニメーション作成ツール", command=self._open_animation_tool)
+        tm.add_command(label="キャラクター再読み込み", command=defer_menu_action(self._reload_character))
+        tm.add_command(label="🎨 高度な画像処理ツール", command=defer_menu_action(self._open_advanced_image_tool))
+        tm.add_command(label="🎬 アニメーション作成ツール", command=defer_menu_action(self._open_animation_tool))
         tm.add_separator()
-        tm.add_command(label="VOICEVOX 接続確認",     command=self._check_voicevox)
+        tm.add_command(label="VOICEVOX 接続確認",     command=defer_menu_action(self._check_voicevox))
         tm.add_separator()
-        tm.add_command(label="ログフォルダを開く",    command=self._open_logs)
+        tm.add_command(label="ログフォルダを開く",    command=defer_menu_action(self._open_logs))
         menubar.add_cascade(label="ツール", menu=tm)
 
         hm = menu(menubar)
-        hm.add_command(label="About", command=self._show_about)
+        hm.add_command(label="About", command=defer_menu_action(self._show_about))
         menubar.add_cascade(label="ヘルプ", menu=hm)
 
         self.root.bind("<Control-comma>", lambda e: self._open_settings())
@@ -4828,6 +4919,8 @@ class AliceMainWindow:
         self.root.after(50, self._set_initial_sash)
         self._build_status_bar(c)
         self._apply_current_layout(reset_geometry=False)
+        self._ensure_chat_input_ready()
+        self._schedule_desktop_split_fix()
 
     def _set_initial_sash(self):
         try:
@@ -4836,6 +4929,72 @@ class AliceMainWindow:
                 self._paned.sashpos(0, int(total * self._CHAT_RATIO))
         except Exception:
             pass
+
+    def _schedule_desktop_split_fix(self) -> None:
+        if self._mode != AppMode.DESKTOP:
+            return
+        for delay in (20, 120, 320):
+            try:
+                self.root.after(delay, self._ensure_desktop_chat_visible)
+            except tk.TclError:
+                return
+
+    def _ensure_desktop_chat_visible(self) -> None:
+        if self._mode != AppMode.DESKTOP:
+            return
+        if not hasattr(self, "_paned") or self._chat_frame is None or self._char_frame is None:
+            return
+        try:
+            panes = set(self._paned.panes())
+            if str(self._chat_frame) not in panes:
+                self._paned.add(self._chat_frame, weight=62)
+            if str(self._char_frame) not in panes:
+                self._paned.add(self._char_frame, weight=38)
+            total = max(self.root.winfo_width(), self.root.winfo_reqwidth(), 900)
+            min_chat = self._DESKTOP_CHAT_MIN_WIDTH
+            max_chat = max(min_chat, total - 260)
+            target = int(total * self._CHAT_RATIO)
+            target = max(min_chat, min(max_chat, target))
+            self._paned.sashpos(0, target)
+            self._ensure_chat_input_ready()
+        except Exception:
+            pass
+
+    def _ensure_chat_input_ready(self) -> None:
+        if self._chat_frame is None:
+            return
+        needs_rebuild = False
+        if not hasattr(self, "_input_box"):
+            needs_rebuild = True
+        else:
+            try:
+                needs_rebuild = not bool(self._input_box.winfo_exists())
+            except Exception:
+                needs_rebuild = True
+
+        if needs_rebuild:
+            self._build_input_area(self._chat_frame, self.colors)
+
+        if self._input_container is not None:
+            try:
+                if not self._input_container.winfo_manager():
+                    self._input_container.pack(fill="x")
+            except Exception:
+                pass
+
+        if hasattr(self, "_input_box"):
+            try:
+                self._input_box.focus_set()
+            except Exception:
+                pass
+
+    def _ensure_startup_desktop_mode(self) -> None:
+        self._mode = AppMode.DESKTOP
+        if self._mode_var is not None:
+            self._mode_var.set(self._mode.value)
+        self._apply_current_layout(reset_geometry=False)
+        self._ensure_chat_input_ready()
+        self._schedule_desktop_split_fix()
 
     def _toggle_mode(self):
         next_mode = AppMode.CHARACTER if self._mode == AppMode.DESKTOP else AppMode.DESKTOP
@@ -4848,6 +5007,8 @@ class AliceMainWindow:
             return
         self._mode = mode
         self._apply_current_layout(reset_geometry=True)
+        if self._mode == AppMode.DESKTOP:
+            self._schedule_desktop_split_fix()
         if self._char_loader:
             self._load_character()
 
@@ -4886,6 +5047,8 @@ class AliceMainWindow:
             self._mode_var.set(self._mode.value)
         mode_text = "キャラクターモード" if self._mode == AppMode.CHARACTER else "デスクトップモード"
         self._update_status(f"{mode_text} に切り替えました。")
+        if self._mode == AppMode.DESKTOP:
+            self._schedule_desktop_split_fix()
 
     def _build_header(self, parent, c):
         h = tk.Frame(parent, bg=c.bg_secondary, height=52)
@@ -4930,6 +5093,7 @@ class AliceMainWindow:
     def _build_input_area(self, parent, c):
         container = tk.Frame(parent, bg=c.bg_secondary, pady=10)
         container.pack(fill="x")
+        self._input_container = container
         inner = tk.Frame(container, bg=c.bg_secondary)
         inner.pack(fill="x", padx=12)
         self._input_box = PlaceholderEntry(
@@ -5022,6 +5186,24 @@ class AliceMainWindow:
                 msg = self._alice.get_greeting()
                 self._enqueue(self._append_alice, msg)
             threading.Thread(target=_greet, daemon=True).start()
+        else:
+            self._append_system("AI未接続です。設定で APIキー / AIモデル を確認してください。")
+
+    def _build_local_fallback_reply(self, user_text: str) -> str:
+        name = self._env.get("ALICE_NAME") if self._env else "Alice"
+        text = user_text.strip()
+        if not text:
+            return f"{name}です。聞きたいことを入力してください。"
+        if "こんにちは" in text or "こんばんは" in text:
+            return f"こんにちは。{name}です。今日はどんなことを進めますか？"
+        if "ありがとう" in text:
+            return "どういたしまして。続きも手伝います。"
+        if "help" in text.lower() or "使い方" in text:
+            return "メッセージ欄に質問を書くと返答します。デスクトップモードでチャット欄が表示されます。"
+        return (
+            "現在AIエンジンが利用できないため、簡易応答で返しています。"
+            "設定を確認すると通常の対話に戻せます。"
+        )
 
     # ---- チャットロジック ----
 
@@ -5041,18 +5223,21 @@ class AliceMainWindow:
 
         def _chat():
             def on_chunk(chunk):
-                self._enqueue(self._append_alice_chunk, chunk)
+                self._enqueue_stream_chunk(chunk)
 
             def on_complete(full):
+                self._enqueue(self._flush_stream_chunks)
                 self._enqueue(self._set_thinking, False)
-                self._enqueue(self._finalize_alice_stream)
+                self._enqueue(self._finalize_stream_with_fallback, full)
                 if self._voice:
                     # スレッドセーフのためキュー経由でUIスレッドに移譲
                     self._enqueue(self._voice.speak, full)
 
             def on_error(err):
+                self._enqueue(self._flush_stream_chunks)
                 self._enqueue(self._append_error, err)
                 self._enqueue(self._set_thinking, False)
+                self._enqueue(self._finalize_alice_stream)
 
             if self._alice:
                 self._alice.send_message(
@@ -5062,7 +5247,10 @@ class AliceMainWindow:
                     on_error=on_error,
                 )
             else:
-                self._enqueue(self._append_alice, "（チャットエンジンが設定されていません）")
+                local_reply = self._build_local_fallback_reply(text)
+                self._enqueue(self._append_alice, local_reply)
+                if self._voice:
+                    self._enqueue(self._voice.speak, local_reply)
                 self._enqueue(self._set_thinking, False)
 
         threading.Thread(target=_chat, daemon=True).start()
@@ -5111,6 +5299,10 @@ class AliceMainWindow:
         self._chat_display.append(chunk, "alice_text")
 
     def _finalize_alice_stream(self):
+        if not self._streaming_started:
+            if hasattr(self, "_animator"):
+                self._animator.set_state(CharacterState.IDLE)
+            return
         self._streaming_started = False
         self._chat_display.append("\n", "alice_text")
         if hasattr(self, "_animator"):

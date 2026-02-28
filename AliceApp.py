@@ -641,6 +641,12 @@ class CharacterLoader:
 
 class AliceApp:
     """起動シーケンスを管理するエントリポイントクラス。"""
+    _MODEL_CANDIDATES = (
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    )
 
     def __init__(self) -> None:
         self._heart:  Optional[AliceHeart]      = None
@@ -682,11 +688,69 @@ class AliceApp:
     def _ensure_model(self) -> tuple:
         """load() 内で検証済みのため verify_model() 重複呼び出しは行わない。"""
         ok, client, model_name = neural.load()
-        if not ok:
-            logger.error("Gemini クライアントのロードに失敗しました。チャット機能は無効化されます。")
+        if ok:
+            logger.info(f"モデルロードOK: {model_name}")
+            return True, client, model_name
+
+        api_key = str(env.get("GOOGLE_API_KEY") or "").strip()
+        if not api_key:
+            logger.error("GOOGLE_API_KEY が未設定のため、AIチャットは無効化されます。")
             return False, None, ""
-        logger.info(f"モデルロードOK: {model_name}")
-        return True, client, model_name
+
+        selected = self._auto_select_model(api_key)
+        if selected:
+            logger.warning(f"モデルを自動選択しました: {selected}")
+            env.write_key("ALICE_MODEL", selected)
+            neural.reset()
+            ok2, client2, model_name2 = neural.load()
+            if ok2:
+                logger.info(f"モデルロードOK（自動選択）: {model_name2}")
+                return True, client2, model_name2
+
+        logger.error("Gemini クライアントのロードに失敗しました。チャット機能は無効化されます。")
+        return False, None, ""
+
+    @classmethod
+    def _auto_select_model(cls, api_key: str) -> Optional[str]:
+        try:
+            from google import genai
+        except Exception as e:
+            logger.warning(f"モデル自動選択をスキップしました（google-genai未利用）: {e}")
+            return None
+
+        try:
+            client = genai.Client(api_key=api_key)
+            models = list(client.models.list())
+            model_ids = [str(getattr(m, "name", "") or "") for m in models]
+            if not model_ids:
+                return None
+
+            for cand in cls._MODEL_CANDIDATES:
+                if cls._is_model_available(cand, model_ids):
+                    return cand
+
+            for mid in model_ids:
+                norm = cls._normalize_model_name(mid)
+                if "gemini" in norm and "flash" in norm:
+                    return norm
+            return cls._normalize_model_name(model_ids[0])
+        except Exception as e:
+            logger.warning(f"モデル自動選択に失敗しました: {e}")
+            return None
+
+    @staticmethod
+    def _normalize_model_name(model_id: str) -> str:
+        return model_id[7:] if model_id.startswith("models/") else model_id
+
+    @classmethod
+    def _is_model_available(cls, candidate: str, model_ids: List[str]) -> bool:
+        full = f"models/{candidate}"
+        return (
+            candidate in model_ids
+            or full in model_ids
+            or any(candidate == cls._normalize_model_name(mid) for mid in model_ids)
+            or any(candidate in mid for mid in model_ids)
+        )
 
     def _init_voice(self) -> Optional[VoiceEngine]:
         try:
