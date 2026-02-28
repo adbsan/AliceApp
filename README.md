@@ -89,6 +89,11 @@ AliceApp/
 - 現状ではキャラクターではなく画像に対してアニメーションが付与されている。
 
 ## 更新履歴
+- 2026-03-01 02:58:18 JST
+  - 上記対応として、ローカル学習済みモデル（GGUF）を Hugging Face から自動DLして対話に利用する実装を履歴へ追記
+  - `module/local_llm_loader_module.py`（DL/ロード）と `src/AI/local_heart.py`（ローカル推論）を追加した内容を記録
+  - `AI_BACKEND`（auto/gemini/local）と Local モデル設定項目（Repo/File/Dir/Token 等）の追加内容を記録
+  - 設定画面の Local タブ追加・設定保存時のローダーリセット・READMEのローカルモデル手順追加を記録
 - 2026-03-01 02:55:01 JST
   - ローカル学習済みモデル（GGUF）をWeb（Hugging Face）から自動DLして利用する機能を追加
   - `AI_BACKEND`（auto/gemini/local）を追加し、Gemini失敗時のローカルLLMフォールバックを実装
