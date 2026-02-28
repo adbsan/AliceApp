@@ -48,10 +48,12 @@ logger.add(
 from module import env_binder_module as env
 from module import local_llm_loader_module as local_loader
 from module import neural_loader_module as neural
+from module import ollama_hf_loader_module as ollama_loader
 from module import prompt_shaper_module as shaper
 from module import result_log_module as result_log
 from src.AI.heart import AliceHeart
 from src.AI.local_heart import LocalAliceHeart
+from src.AI.ollama_heart import OllamaAliceHeart
 
 
 # ============================================================
@@ -668,7 +670,16 @@ class AliceApp:
         self._startup_notice = startup_notice or {}
 
         if ok and client:
-            if backend == "local":
+            if backend == "ollama":
+                base_url = str(client.get("base_url", "http://localhost:11434")) if isinstance(client, dict) else "http://localhost:11434"
+                self._heart = OllamaAliceHeart(
+                    model_name=model_name,
+                    base_url=base_url,
+                    max_tokens=int(env.get("LOCAL_MODEL_MAX_TOKENS")),
+                    temperature=float(env.get("LOCAL_MODEL_TEMPERATURE")),
+                    top_p=float(env.get("LOCAL_MODEL_TOP_P")),
+                )
+            elif backend == "local":
                 self._heart = LocalAliceHeart(
                     llm=client,
                     model_name=model_name,
@@ -704,11 +715,23 @@ class AliceApp:
 
         Returns:
             (ok, backend, client, model_name, startup_notice)
-            backend: "gemini" | "local" | ""
+            backend: "gemini" | "ollama" | "local" | ""
         """
         backend_pref = str(env.get("AI_BACKEND") or "auto").strip().lower()
-        if backend_pref not in ("auto", "gemini", "local"):
+        if backend_pref not in ("auto", "gemini", "ollama", "local"):
             backend_pref = "auto"
+
+        if backend_pref in ("auto", "ollama", "local"):
+            ok, client, model_name, startup_notice = self._ensure_ollama_model()
+            if ok and client:
+                if backend_pref == "auto" and not startup_notice.get("auto_selected"):
+                    startup_notice = {
+                        "auto_selected": True,
+                        "backend": "ollama",
+                        "model_name": model_name,
+                        "message": f"AI_BACKEND=auto により Ollama を選択しました: {model_name}",
+                    }
+                return True, "ollama", client, model_name, startup_notice
 
         if backend_pref in ("auto", "gemini"):
             ok, client, model_name, startup_notice = self._ensure_gemini_model()
@@ -777,6 +800,20 @@ class AliceApp:
                 notice.setdefault("message", f"ローカルモデルを自動選択しました: {model_label}")
             return True, llm, model_label, notice
         logger.warning("Local LLM のロードに失敗しました。")
+        return False, None, "", {}
+
+    def _ensure_ollama_model(self) -> tuple:
+        ok, client_info, model_name, selection_info = ollama_loader.load()
+        if ok and client_info:
+            logger.info(f"Ollama モデルロードOK: {model_name}")
+            notice = dict(selection_info or {})
+            notice.setdefault("backend", "ollama")
+            notice.setdefault("model_name", model_name)
+            if notice.get("model_switched"):
+                notice["auto_selected"] = True
+                notice.setdefault("message", f"Ollamaモデルを切り替えました: {model_name}")
+            return True, client_info, model_name, notice
+        logger.warning("Ollama モデルロードに失敗しました。")
         return False, None, "", {}
 
     @classmethod

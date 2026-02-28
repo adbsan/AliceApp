@@ -36,7 +36,7 @@ _ENV_SCHEMA: Dict[str, Dict[str, Any]] = {
     "GOOGLE_API_KEY":         {"type": str,   "default": ""},
     "ALICE_MODEL":            {"type": str,   "default": "gemini-2.0-flash"},
     "ALICE_NAME":             {"type": str,   "default": "Alice"},
-    "AI_BACKEND":             {"type": str,   "default": "auto"},  # auto | gemini | local
+    "AI_BACKEND":             {"type": str,   "default": "auto"},  # auto | gemini | ollama | local
 
     # Local LLM (llama.cpp + GGUF)
     "LOCAL_MODEL_REPO":       {"type": str,   "default": "auto"},
@@ -50,6 +50,9 @@ _ENV_SCHEMA: Dict[str, Dict[str, Any]] = {
     "LOCAL_MODEL_N_GPU_LAYERS":{"type": int,  "default": 0},
     "LOCAL_MODEL_CHAT_FORMAT":{"type": str,   "default": ""},
     "HF_TOKEN":               {"type": str,   "default": ""},
+    "OLLAMA_URL":             {"type": str,   "default": "http://localhost:11434"},
+    "OLLAMA_MODEL_NAME":      {"type": str,   "default": "alice-auto"},
+    "ACTIVE_OLLAMA_MODEL":    {"type": str,   "default": ""},
 
     # VOICEVOX
     "VOICEVOX_URL":           {"type": str,   "default": "http://localhost:50021"},

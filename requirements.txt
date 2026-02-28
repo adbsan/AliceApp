@@ -26,6 +26,8 @@ loguru>=0.7.2
 
 # 音声（任意・Windowsのみwinsoundにフォールバック可）
 pygame>=2.6.0
+SpeechRecognition>=3.10.0
+# pyaudio>=0.2.14  # マイク入力を使う場合に必要（環境に応じて導入）
 
 # 型ヒント補助
 typing_extensions>=4.8.0
