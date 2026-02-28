@@ -20,10 +20,6 @@ copy .env.example .env
 ### 3. キャラクター画像の配置
 ```
 assets/images/alice_default.png   ... 全身立ち絵（必須）
-assets/images/alice_idle.png      ... 待機ポーズ（任意）
-assets/images/alice_speaking.png  ... 話し中ポーズ（任意）
-assets/images/alice_thinking.png  ... 考え中ポーズ（任意）
-assets/images/alice_greeting.png  ... 挨拶ポーズ（任意）
 ```
 
 > **注意**: `assets/images/` に PNG ファイルを直接配置してください。  
