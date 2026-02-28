@@ -39,8 +39,8 @@ _ENV_SCHEMA: Dict[str, Dict[str, Any]] = {
     "AI_BACKEND":             {"type": str,   "default": "auto"},  # auto | gemini | local
 
     # Local LLM (llama.cpp + GGUF)
-    "LOCAL_MODEL_REPO":       {"type": str,   "default": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"},
-    "LOCAL_MODEL_FILE":       {"type": str,   "default": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"},
+    "LOCAL_MODEL_REPO":       {"type": str,   "default": "auto"},
+    "LOCAL_MODEL_FILE":       {"type": str,   "default": "auto"},
     "LOCAL_MODEL_DIR":        {"type": str,   "default": "assets/models"},
     "LOCAL_MODEL_N_CTX":      {"type": int,   "default": 2048},
     "LOCAL_MODEL_MAX_TOKENS": {"type": int,   "default": 256},

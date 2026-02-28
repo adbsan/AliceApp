@@ -19,7 +19,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 ROOT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT_DIR))
@@ -656,6 +656,7 @@ class AliceApp:
         self._voice:  Optional[VoiceEngine]     = None
         self._git:    Optional[GitManager]      = None
         self._loader: Optional[CharacterLoader] = None
+        self._startup_notice: Dict[str, Any]    = {}
 
     def start(self) -> None:
         logger.info("=" * 60)
@@ -663,7 +664,8 @@ class AliceApp:
         logger.info("=" * 60)
 
         self._load_config()
-        ok, backend, client, model_name = self._ensure_model()
+        ok, backend, client, model_name, startup_notice = self._ensure_model()
+        self._startup_notice = startup_notice or {}
 
         if ok and client:
             if backend == "local":
@@ -701,7 +703,7 @@ class AliceApp:
         AIバックエンドを初期化する。
 
         Returns:
-            (ok, backend, client, model_name)
+            (ok, backend, client, model_name, startup_notice)
             backend: "gemini" | "local" | ""
         """
         backend_pref = str(env.get("AI_BACKEND") or "auto").strip().lower()
@@ -709,28 +711,28 @@ class AliceApp:
             backend_pref = "auto"
 
         if backend_pref in ("auto", "gemini"):
-            ok, client, model_name = self._ensure_gemini_model()
+            ok, client, model_name, startup_notice = self._ensure_gemini_model()
             if ok and client:
-                return True, "gemini", client, model_name
+                return True, "gemini", client, model_name, startup_notice
 
         if backend_pref in ("auto", "local"):
-            ok, client, model_name = self._ensure_local_model()
+            ok, client, model_name, startup_notice = self._ensure_local_model()
             if ok and client:
-                return True, "local", client, model_name
+                return True, "local", client, model_name, startup_notice
 
         logger.error("利用可能なAIバックエンドが見つかりませんでした。")
-        return False, "", None, ""
+        return False, "", None, "", {}
 
     def _ensure_gemini_model(self) -> tuple:
         ok, client, model_name = neural.load()
         if ok:
             logger.info(f"Gemini モデルロードOK: {model_name}")
-            return True, client, model_name
+            return True, client, model_name, {}
 
         api_key = str(env.get("GOOGLE_API_KEY") or "").strip()
         if not api_key:
             logger.warning("GOOGLE_API_KEY が未設定のため、Gemini接続をスキップします。")
-            return False, None, ""
+            return False, None, "", {}
 
         selected = self._auto_select_model(api_key)
         if selected:
@@ -740,18 +742,28 @@ class AliceApp:
             ok2, client2, model_name2 = neural.load()
             if ok2:
                 logger.info(f"Gemini モデルロードOK（自動選択）: {model_name2}")
-                return True, client2, model_name2
+                return True, client2, model_name2, {
+                    "auto_selected": True,
+                    "backend": "gemini",
+                    "model_name": model_name2,
+                    "message": f"Geminiモデルを自動選択しました: {model_name2}",
+                }
 
         logger.warning("Gemini クライアントのロードに失敗しました。")
-        return False, None, ""
+        return False, None, "", {}
 
     def _ensure_local_model(self) -> tuple:
-        ok, llm, model_label = local_loader.load()
+        ok, llm, model_label, selection_info = local_loader.load()
         if ok and llm:
             logger.info(f"Local モデルロードOK: {model_label}")
-            return True, llm, model_label
+            notice = dict(selection_info or {})
+            if notice.get("auto_selected"):
+                notice.setdefault("backend", "local")
+                notice.setdefault("model_name", model_label)
+                notice.setdefault("message", f"ローカルモデルを自動選択しました: {model_label}")
+            return True, llm, model_label, notice
         logger.warning("Local LLM のロードに失敗しました。")
-        return False, None, ""
+        return False, None, "", {}
 
     @classmethod
     def _auto_select_model(cls, api_key: str) -> Optional[str]:
@@ -813,6 +825,7 @@ class AliceApp:
                 voice_engine = self._voice,
                 git_manager  = self._git,
                 char_loader  = self._loader,
+                startup_notice = self._startup_notice,
             )
             logger.info("GUI 起動完了。メインループを開始します。")
             window.run()

@@ -19,7 +19,7 @@ copy .env.example .env
 
 #### ローカルモデルを使う場合（任意）
 - `.env` で `AI_BACKEND=local` または `AI_BACKEND=auto` を設定
-- `LOCAL_MODEL_REPO` / `LOCAL_MODEL_FILE` を指定
+- `LOCAL_MODEL_REPO` / `LOCAL_MODEL_FILE` は `auto` 推奨（PCスペックに応じて自動選択）
 - 起動時に Hugging Face から GGUF をダウンロードして利用
 - 既定値は TinyLlama GGUF（`TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`）
 
@@ -89,6 +89,12 @@ AliceApp/
 - 現状ではキャラクターではなく画像に対してアニメーションが付与されている。
 
 ## 更新履歴
+- 2026-03-01 03:16:25 JST
+  - 起動時フローを修正し、初回表示から `デスクトップモード` でチャット履歴・入力欄・送信ボタン・音声ボタンを表示するように改善
+  - チャット履歴ウィジェットと入力ウィジェットの存在チェック/再構築処理を追加し、欠落時でも自動復旧するように修正
+  - モデル自動選択時に非ブロッキングのポップアップを表示し、選択モデル情報を表示した後に5秒でデスクトップ画面へ復帰する処理を追加
+  - `AliceApp.py` から `module/window_module.py` へ自動選択モデル情報を連携し、起動時に通知できるように実装
+  - `LOCAL_MODEL_REPO` / `LOCAL_MODEL_FILE` の既定値を `auto` 化し、PCスペックに応じたローカルモデル自動選択・DLを標準動作に変更
 - 2026-03-01 02:58:18 JST
   - 上記対応として、ローカル学習済みモデル（GGUF）を Hugging Face から自動DLして対話に利用する実装を履歴へ追記
   - `module/local_llm_loader_module.py`（DL/ロード）と `src/AI/local_heart.py`（ローカル推論）を追加した内容を記録

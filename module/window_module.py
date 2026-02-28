@@ -4729,12 +4729,14 @@ class AliceMainWindow:
         voice_engine=None,
         git_manager=None,
         char_loader=None,
+        startup_notice: Optional[Dict[str, object]] = None,
     ) -> None:
         self._env         = env_binder
         self._alice       = alice_engine
         self._voice       = voice_engine
         self._git         = git_manager
         self._char_loader = char_loader
+        self._startup_notice = dict(startup_notice or {})
 
         theme_name = env_binder.get("APP_THEME") if env_binder else "dark"
         self.colors = Theme.get(theme_name)
@@ -4751,17 +4753,126 @@ class AliceMainWindow:
         self._statusbar_frame: Optional[tk.Frame] = None
         self._chat_frame: Optional[tk.Frame] = None
         self._char_frame: Optional[tk.Frame] = None
+        self._chat_display_container: Optional[tk.Frame] = None
+        self._chat_display: Optional[AutoScrollText] = None
         self._input_container: Optional[tk.Frame] = None
+        self._input_box: Optional[PlaceholderEntry] = None
+        self._send_btn: Optional[tk.Button] = None
+        self._voice_btn: Optional[tk.Button] = None
+        self._startup_popup: Optional[tk.Toplevel] = None
+        self._startup_popup_after_id: Optional[str] = None
 
         self.root = tk.Tk()
         self._setup_window()
         self._build_ui()
-        self.root.after(0, self._ensure_startup_desktop_mode)
+        self.root.after(0, self._bootstrap_startup)
         self._start_services()
 
     def run(self) -> None:
         self.root.after(100, self._process_queue)
         self.root.mainloop()
+
+    def _bootstrap_startup(self) -> None:
+        self._ensure_startup_desktop_mode()
+        self._show_startup_model_popup_if_needed()
+
+    def _show_startup_model_popup_if_needed(self) -> None:
+        info = dict(self._startup_notice or {})
+        if not info.get("auto_selected"):
+            return
+        if self._startup_popup is not None and self._widget_exists(self._startup_popup):
+            return
+
+        c = self.colors
+        popup = tk.Toplevel(self.root)
+        popup.title("AIモデル自動選択")
+        popup.configure(bg=c.bg_secondary)
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        try:
+            popup.attributes("-topmost", True)
+        except Exception:
+            pass
+        popup.protocol("WM_DELETE_WINDOW", self._close_startup_model_popup)
+
+        title = tk.Label(
+            popup,
+            text="AIモデルを自動選択しました",
+            bg=c.bg_secondary,
+            fg=c.accent_primary,
+            font=("Segoe UI", 12, "bold"),
+        )
+        title.pack(anchor="w", padx=16, pady=(14, 6))
+
+        details: List[str] = []
+        backend = str(info.get("backend") or "").strip().lower()
+        model_name = str(info.get("model_name") or info.get("model_label") or "").strip()
+        profile_label = str(info.get("profile_label") or "").strip()
+        ram_gb = info.get("ram_gb")
+        cpu_count = info.get("cpu_count")
+
+        if backend:
+            details.append(f"バックエンド: {backend}")
+        if model_name:
+            details.append(f"モデル: {model_name}")
+        if profile_label:
+            details.append(f"選択プロファイル: {profile_label}")
+        if ram_gb is not None and cpu_count is not None:
+            details.append(f"検出スペック: RAM {ram_gb} GB / CPU {cpu_count} cores")
+        msg = str(info.get("message") or "").strip()
+        if msg:
+            details.append(msg)
+        details.append("5秒後にデスクトップモードへ戻ります。")
+
+        body = tk.Label(
+            popup,
+            text="\n".join(details),
+            justify="left",
+            bg=c.bg_secondary,
+            fg=c.text_primary,
+            font=("Segoe UI", 10),
+        )
+        body.pack(anchor="w", padx=16, pady=(0, 14))
+
+        self._startup_popup = popup
+        self._center_window(popup, width=560, height=220)
+        self._startup_popup_after_id = self.root.after(5000, self._close_startup_model_popup)
+
+    def _center_window(self, win: tk.Toplevel, width: int, height: int) -> None:
+        try:
+            self.root.update_idletasks()
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _close_startup_model_popup(self) -> None:
+        if self._startup_popup_after_id is not None:
+            try:
+                self.root.after_cancel(self._startup_popup_after_id)
+            except Exception:
+                pass
+            self._startup_popup_after_id = None
+
+        popup = self._startup_popup
+        self._startup_popup = None
+        if popup is not None and self._widget_exists(popup):
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+
+        self._ensure_startup_desktop_mode()
+
+    @staticmethod
+    def _widget_exists(widget: Optional[tk.Widget]) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except Exception:
+            return False
 
     def _enqueue(self, fn, *args, **kwargs):
         try:
@@ -4934,6 +5045,7 @@ class AliceMainWindow:
         self.root.after(50, self._set_initial_sash)
         self._build_status_bar(c)
         self._apply_current_layout(reset_geometry=False)
+        self._ensure_chat_display_ready()
         self._ensure_chat_input_ready()
         self._schedule_desktop_split_fix()
 
@@ -4971,33 +5083,65 @@ class AliceMainWindow:
             target = int(total * self._CHAT_RATIO)
             target = max(min_chat, min(max_chat, target))
             self._paned.sashpos(0, target)
+            self._ensure_chat_display_ready()
             self._ensure_chat_input_ready()
         except Exception:
             pass
 
+    def _ensure_chat_display_ready(self) -> None:
+        if self._chat_frame is None:
+            return
+
+        if not self._widget_exists(self._chat_display):
+            self._build_chat_display(self._chat_frame, self.colors)
+            return
+
+        if self._chat_display_container is not None and self._widget_exists(self._chat_display_container):
+            try:
+                if not self._chat_display_container.winfo_manager():
+                    if self._input_container is not None and self._widget_exists(self._input_container):
+                        self._chat_display_container.pack(fill="both", expand=True, before=self._input_container)
+                    else:
+                        self._chat_display_container.pack(fill="both", expand=True)
+            except Exception:
+                pass
+
     def _ensure_chat_input_ready(self) -> None:
         if self._chat_frame is None:
             return
-        needs_rebuild = False
-        if not hasattr(self, "_input_box"):
-            needs_rebuild = True
-        else:
-            try:
-                needs_rebuild = not bool(self._input_box.winfo_exists())
-            except Exception:
-                needs_rebuild = True
+        needs_rebuild = (
+            (not self._widget_exists(self._input_box))
+            or (not self._widget_exists(self._send_btn))
+            or (not self._widget_exists(self._voice_btn))
+        )
 
         if needs_rebuild:
             self._build_input_area(self._chat_frame, self.colors)
 
-        if self._input_container is not None:
+        if self._input_container is not None and self._widget_exists(self._input_container):
             try:
                 if not self._input_container.winfo_manager():
-                    self._input_container.pack(fill="x")
+                    if self._chat_display_container is not None and self._widget_exists(self._chat_display_container):
+                        self._input_container.pack(fill="x", after=self._chat_display_container)
+                    else:
+                        self._input_container.pack(fill="x")
             except Exception:
                 pass
 
-        if hasattr(self, "_input_box"):
+        if self._widget_exists(self._voice_btn):
+            try:
+                if not self._voice_btn.winfo_manager():
+                    self._voice_btn.pack(pady=2)
+            except Exception:
+                pass
+        if self._widget_exists(self._send_btn):
+            try:
+                if not self._send_btn.winfo_manager():
+                    self._send_btn.pack(pady=2)
+            except Exception:
+                pass
+
+        if self._widget_exists(self._input_box):
             try:
                 self._input_box.focus_set()
             except Exception:
@@ -5008,6 +5152,7 @@ class AliceMainWindow:
         if self._mode_var is not None:
             self._mode_var.set(self._mode.value)
         self._apply_current_layout(reset_geometry=False)
+        self._ensure_chat_display_ready()
         self._ensure_chat_input_ready()
         self._schedule_desktop_split_fix()
 
@@ -5079,8 +5224,14 @@ class AliceMainWindow:
         self._status_label.pack(side="right", padx=2)
 
     def _build_chat_display(self, parent, c):
+        if self._chat_display_container is not None and self._widget_exists(self._chat_display_container):
+            try:
+                self._chat_display_container.destroy()
+            except Exception:
+                pass
         f = tk.Frame(parent, bg=c.bg_primary)
         f.pack(fill="both", expand=True)
+        self._chat_display_container = f
         sb = ttk.Scrollbar(f, orient="vertical")
         sb.pack(side="right", fill="y")
         fsz = 13
@@ -5106,6 +5257,11 @@ class AliceMainWindow:
         d.tag_configure("error",      foreground=c.accent_error, font=("Segoe UI", fsz - 1))
 
     def _build_input_area(self, parent, c):
+        if self._input_container is not None and self._widget_exists(self._input_container):
+            try:
+                self._input_container.destroy()
+            except Exception:
+                pass
         container = tk.Frame(parent, bg=c.bg_secondary, pady=10)
         container.pack(fill="x")
         self._input_container = container
@@ -5229,6 +5385,15 @@ class AliceMainWindow:
         return "continue"
 
     def _on_send(self):
+        if not self._widget_exists(self._input_box):
+            self._ensure_chat_input_ready()
+        if not self._widget_exists(self._input_box):
+            return
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
+
         text = self._input_box.get_text()
         if not text:
             return
@@ -5286,24 +5451,38 @@ class AliceMainWindow:
         has_pending = bool(getattr(self._voice, "has_pending_speech", False)) if self._voice else False
         if self._voice and (self._voice.is_speaking or has_pending):
             self._voice.stop()
-            self._voice_btn.configure(text="音声")
+            if self._widget_exists(self._voice_btn):
+                self._voice_btn.configure(text="音声")
         elif self._voice:
-            self._voice_btn.configure(text="停止")
+            if self._widget_exists(self._voice_btn):
+                self._voice_btn.configure(text="停止")
 
     # ---- チャット表示ヘルパー ----
 
     def _append_user(self, text):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         ts = datetime.now().strftime("%H:%M")
         self._chat_display.append(f"\n[{ts}] あなた\n", "user_name")
         self._chat_display.append(f"{text}\n", "user_text")
 
     def _append_alice(self, text):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         name = self._env.get("ALICE_NAME") if self._env else "Alice"
         ts = datetime.now().strftime("%H:%M")
         self._chat_display.append(f"\n[{ts}] {name}\n", "alice_name")
         self._chat_display.append(f"{text}\n", "alice_text")
 
     def _append_alice_chunk(self, chunk):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         if not self._streaming_started:
             self._streaming_started = True
             name = self._env.get("ALICE_NAME") if self._env else "Alice"
@@ -5324,12 +5503,24 @@ class AliceMainWindow:
             self._animator.set_state(CharacterState.IDLE)
 
     def _append_system(self, text):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         self._chat_display.append(f"\n{text}\n", "system")
 
     def _append_error(self, text):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         self._chat_display.append(f"\nエラー: {text}\n", "error")
 
     def _clear_chat(self):
+        if not self._widget_exists(self._chat_display):
+            self._ensure_chat_display_ready()
+        if not self._widget_exists(self._chat_display):
+            return
         if messagebox.askyesno("クリア", "チャット履歴をクリアしますか？"):
             self._chat_display.clear()
             if self._alice:
@@ -5513,6 +5704,7 @@ class AliceMainWindow:
 
     def _on_close(self):
         if messagebox.askyesno("終了", "Alice AI を終了しますか？"):
+            self._close_startup_model_popup()
             if hasattr(self, "_animator"):
                 self._animator.stop()
             if self._voice:
