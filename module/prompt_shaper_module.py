@@ -24,11 +24,22 @@ from module import env_binder_module as env
 # ============================================================
 # デフォルトペルソナ
 # ============================================================
+# 修正 v2: Gemini / TinyLlama 両対応。
+# - Gemini は contents[0] が "model" だと続き補完になるバグとは別に、
+#   ペルソナ指示が弱いと脱線しやすい。明確なルール形式にすることで
+#   どちらのモデルでも安定した応答を得る。
+# - "Do NOT continue a sentence" で途中から始まる生成を防止。
+# - ロールプレイ禁止を強調。
 _DEFAULT_PERSONA = (
-    "あなたは「Alice」という名前のAIアシスタントです。"
-    "さくら荘のメイドちゃんにインスパイアされた、知的で親切なAIです。"
-    "ユーザーの相棒として日常のタスクをサポートします。"
-    "丁寧で温かみのある言葉遣いを心がけてください。"
+    "You are Alice, a helpful AI assistant. "
+    "Follow these rules strictly:\n"
+    "1. Always respond in Japanese.\n"
+    "2. Start your response from the very beginning of a new sentence. "
+    "Never continue or complete a sentence that was already started.\n"
+    "3. Only respond to the user's actual message. "
+    "Never generate roleplay, fictional dialogue, or narrative scenes.\n"
+    "4. Be concise, warm, and direct. "
+    "Do not add unrelated information or unsolicited questions."
 )
 
 
@@ -85,6 +96,15 @@ def build_payload(
     # 直近 max_history 件の履歴を Gemini API 形式に変換
     trimmed = history[-max_history:] if len(history) > max_history else history
     contents = [msg.to_genai_format() for msg in trimmed]
+
+    # -------------------------------------------------------
+    # 修正: Gemini API は contents[0].role が "model" だと
+    # そのモデル発話の「続き」として補完してしまう。
+    # get_greeting() がアシスタント発話を履歴の先頭に追加するため
+    # この状態が発生する。先頭が "model" の場合は除去する。
+    # -------------------------------------------------------
+    while contents and contents[0].get("role") == "model":
+        contents.pop(0)
 
     # 現在のユーザー入力を末尾に追加
     contents.append({
