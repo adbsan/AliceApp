@@ -16,6 +16,13 @@ result_log_module.py
     このモジュールファイルを起点とした絶対パスに変更した。
     これにより、AliceApp.py と異なるディレクトリから実行された場合でも
     ログが意図しない場所に書かれるバグを防ぐ。
+
+  - [v2] load_history() に形式正規化処理を追加。
+    save_result() は {"user":..., "alice":...} 形式で保存するが、
+    save_history() は {"role":..., "content":...} (Message形式) で保存する。
+    混在した履歴ファイルを読み込んだ場合に AliceApp.py 側で
+    Message.from_dict() がクラッシュする問題を防ぐため、
+    load_history() で両形式を Message 形式に統一して返すようにした。
 """
 
 from __future__ import annotations
@@ -90,16 +97,54 @@ def load_history() -> List[Dict[str, Any]]:
     """
     チャット履歴ファイルを読み込む。
 
+    両方の保存形式（save_result / save_history）を Message 形式に正規化して返す。
+      - save_result 形式: {"timestamp":..., "user":..., "alice":..., "error":...}
+      - save_history 形式: {"role":..., "content":..., "timestamp":...}
+
     Returns:
-        メッセージ dict のリスト。ファイルが存在しない場合は空リスト。
+        Message 形式 dict のリスト。ファイルが存在しない場合は空リスト。
     """
     if not _CHAT_HISTORY_FILE.exists():
         return []
     try:
         with open(_CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        logger.info(f"チャット履歴を読み込みました: {len(data)}件")
-        return data
+
+        # -----------------------------------------------------------------
+        # 形式正規化: save_result() で保存された古い形式を Message 形式に変換
+        # -----------------------------------------------------------------
+        normalized: List[Dict[str, Any]] = []
+        for entry in data:
+            if "role" in entry and "content" in entry:
+                # すでに Message 形式 → そのまま使用
+                normalized.append(entry)
+            elif "user" in entry or "alice" in entry:
+                # save_result() 形式 → user/alice の2件に展開
+                ts = entry.get("timestamp", "")
+                user_text = entry.get("user", "").strip()
+                alice_text = entry.get("alice", "").strip()
+                error = entry.get("error")
+
+                if user_text:
+                    normalized.append({
+                        "role": "user",
+                        "content": user_text,
+                        "timestamp": ts,
+                    })
+                # エラーがある場合はアシスタント発話を追加しない
+                if alice_text and not error:
+                    normalized.append({
+                        "role": "assistant",
+                        "content": alice_text,
+                        "timestamp": ts,
+                    })
+            else:
+                # 未知の形式はスキップ（ログのみ出力）
+                logger.warning(f"load_history: 未知の履歴形式をスキップ: {list(entry.keys())}")
+
+        logger.info(f"チャット履歴を読み込みました: {len(normalized)}件")
+        return normalized
+
     except Exception as e:
         logger.error(f"履歴読み込みエラー: {e}")
         return []

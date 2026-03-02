@@ -81,10 +81,14 @@ class AliceEngine:
         if not user_input.strip():
             return
 
+        # 今回のユーザー発話を履歴に追加した上で、
+        # build_payload には末尾（今回分）を除いた過去履歴を渡す。
+        # build_payload() 内で user_input が contents の末尾に追加されるため、
+        # history[:-1] + user_input の順序で Gemini/Ollama に渡される。
         self._history.append(shaper.new_message("user", user_input))
         payload = shaper.build_payload(
             user_input=user_input,
-            history=self._history[:-1],
+            history=self._history[:-1],   # 今回のuser発話は build_payload が末尾追加する
             max_history=50,
             persona="",
             temperature=0.9,
@@ -105,12 +109,21 @@ class AliceEngine:
                 on_error(result["error"] or "不明なエラーが発生しました。")
 
     def get_greeting(self) -> str:
+        """
+        起動時の挨拶文を返す。
+
+        修正: 以前は挨拶を assistant 発話として履歴に追加していたが、
+        Gemini API の仕様上 contents[0].role が "model" になると
+        その続きを補完する挙動が起きるため、履歴への追加を廃止した。
+        挨拶文はハードコードのままGUIに表示するのみとし、
+        チャット履歴には含めない。
+        """
         name = env.get("ALICE_NAME")
         msg = (
             f"こんにちは！私は {name} です。\n"
             "何でもお気軽に話しかけてください。お手伝いします！"
         )
-        self._history.append(shaper.new_message("assistant", msg))
+        # ※ self._history.append() は行わない
         return msg
 
     def clear_history(self) -> None:
